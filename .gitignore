@@ -1,0 +1,8 @@
+dhd/
+StarCraft-Motion/
+camera_data_1.csv
+camera_data_2.csv
+camera_data_3.csv
+camera_data_4.csv
+orbit_simulation_1000_objects_positions.csv
+src/.env

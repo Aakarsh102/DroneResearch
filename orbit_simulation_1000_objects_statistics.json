@@ -1,0 +1,28 @@
+{
+  "total_objects": 1500,
+  "total_time_steps": 500,
+  "total_position_records": 750000,
+  "total_camera_events": 53942,
+  "events_per_camera": {
+    "Camera_Q1": {
+      "total_events": 13514,
+      "enter_events": 6946,
+      "exit_events": 6568
+    },
+    "Camera_Q2": {
+      "total_events": 13501,
+      "enter_events": 6919,
+      "exit_events": 6582
+    },
+    "Camera_Q3": {
+      "total_events": 13446,
+      "enter_events": 6923,
+      "exit_events": 6523
+    },
+    "Camera_Q4": {
+      "total_events": 13481,
+      "enter_events": 6933,
+      "exit_events": 6548
+    }
+  }
+}
