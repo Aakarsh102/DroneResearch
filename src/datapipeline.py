@@ -9,7 +9,9 @@ import time
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from collections import defaultdict
-
+global_df = pd.read_csv("orbit_simulation_1000_objects_positions.csv")
+global_sored = global_df.sort_values(by = ['object_id', 'time_step']).reset_index(drop=True)
+global_grouped = global_df.groupby('object_id')
 class PipelineConfig:
     sequence_length: int = 10
     input_length: int = 30     # in_len
@@ -17,21 +19,25 @@ class PipelineConfig:
     sync_interval: int = 5     # t - synchronization every t time steps
     batch_size: int = 32
     num_cameras: int = 4
+    num_devices: int = 4
     input_features: int = 6    # time_step, object_id, x, y, radius, angular_velocity, direction
     position_features: int = 2  # x, y for output
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 class CameraDataset(Dataset):
-    def __init__ (self, df: pd.DataFrame, config: PipelineConfig, camera_id: int):
-        self.df = df.sort_values(by = ['object_id', 'time_step'])
+    """Dataset for individual camera sequences - generates sequences on-the-fly"""
+    def __init__(self, df: pd.DataFrame, config: PipelineConfig, camera_id: int):
+        self.df = df.sort_values(['object_id', 'time_step'])
+    
         self.config = config
-        self.data = self.preprocess_data()
         self.camera_id = camera_id
-
+        
+        # Create index mapping for efficient sequence generation
         self.object_groups = {}
+        self.global_object_groups = {}
         self.sequence_indices = []
         
-        # Group by object_id and store start indices for each valid sequence
+        # Group camera data by object_id
         for object_id, group in self.df.groupby('object_id'):
             group_sorted = group.sort_values('time_step').reset_index(drop=True)
             self.object_groups[object_id] = group_sorted
@@ -40,7 +46,12 @@ class CameraDataset(Dataset):
             num_sequences = len(group_sorted) - self.config.sequence_length + 1
             for i in range(num_sequences):
                 self.sequence_indices.append((object_id, i))
-
+        
+        # Group global data by object_id for target generation
+        for object_id, group in global_grouped:
+            group_sorted = group.sort_values('time_step').reset_index(drop=True)
+            self.global_object_groups[object_id] = group_sorted
+    
     def __len__(self):
         return len(self.sequence_indices)
     
@@ -49,32 +60,46 @@ class CameraDataset(Dataset):
         object_id, start_idx = self.sequence_indices[idx]
         group_data = self.object_groups[object_id]
         
-        # Extract sequence data without copying
+        # Extract sequence data for input (from camera view)
         sequence_data = group_data.iloc[start_idx:start_idx + self.config.sequence_length]
         
         # Input features: [time_step, object_id, x, y, radius, angular_velocity, direction]
         input_features = sequence_data[['time_step', 'object_id', 'x', 'y', 'radius', 'angular_velocity', 'direction']].values
         input_seq = torch.FloatTensor(input_features[:self.config.input_length])
         
-        # Output targets: [x, y] positions for prediction
-        output_positions = sequence_data[['x', 'y']].values[self.config.input_length:]
-        output_seq = torch.FloatTensor(output_positions)
-        
-        # Time steps for synchronization
+        # Get time steps for the sequence
         time_steps = sequence_data['time_step'].tolist()
+        output_time_steps = time_steps[self.config.input_length:]
+        
+        # Generate targets: ALL objects' positions at output time steps
+        all_object_targets = []
+        for time_step in output_time_steps:
+            # Get positions of ALL objects at this time step from global data
+            global_positions_at_t = []
+            for global_obj_id in sorted(self.global_object_groups.keys()):
+                global_group = self.global_object_groups[global_obj_id]
+                time_mask = global_group['time_step'] == time_step
+                
+                if time_mask.any():
+                    obj_data = global_group[time_mask].iloc[0]
+                    global_positions_at_t.extend([obj_data['x'], obj_data['y']])
+                else:
+                    # If object not visible at this time step, use NaN or last known position
+                    global_positions_at_t.extend([float('nan'), float('nan')])
+            
+            all_object_targets.append(global_positions_at_t)
+        
+        # Convert to tensor: [output_length, total_objects * 2]  # 2 for x,y per object
+        output_seq = torch.FloatTensor(all_object_targets)
         
         return input_seq, output_seq, object_id, time_steps
-    
 class CameraProcessor:
     def __init__(self, camera_id: int, df: pd.DataFrame, config: PipelineConfig):
         self.camera_id = camera_id
         self.config = config
         self.dataset = CameraDataset(df, config, camera_id)
         self.dataloader = DataLoader(self.dataset, batch_size=config.batch_size, shuffle=True)
-        self.queue = queue.Queue()
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self.process_data)
-        self.thread.start()
+
 
         self.trajectory_model = TrajectoryPredictionModel(
             sequence_input_dim=config.input_features,
@@ -103,16 +128,16 @@ class CameraProcessor:
             output_seq = output_seq.to(self.config.device)
 
             # Predict trajectory using the model
-            predictions = self.trajectory_model(input_seq)
-            local_predictions.append((object_ids, predictions.cpu().numpy(), time_steps))
+            # predictions = self.trajectory_model(input_seq)
+            # local_predictions.append((object_ids, predictions.cpu().numpy(), time_steps))
 
             with torch.inference_mode():
-                prediction = self.trajectory_model(input_seq)
+                predictions = self.trajectory_model(input_seq)
                 local_predictions.append((predictions, object_ids, time_steps))
 
             return local_predictions
         
-    def run_camera_thread(self, sync_manager):
+    def run_camera_thread(self):
         """Main processing loop for camera thread"""
         print(f"Camera {self.camera_id} thread started")
         
@@ -135,10 +160,17 @@ class CameraProcessor:
                         'local_predictions': local_preds
                     })
                     
-                    # Wait for global context
+                    # Wait for global context and use it
                     try:
-                        global_context = self.incoming_queue.get(timeout=10.0)
+                        global_data = self.incoming_queue.get(timeout=10.0)
+                        global_context = global_data['global_context']
+                        all_predictions = global_data['all_predictions']
+                        
                         print(f"Camera {self.camera_id} received global context at time {self.current_time_step}")
+                        
+                        # TODO: Use global_context and all_predictions for further processing
+                        # This is where you'd update local models or store final predictions
+                        
                     except queue.Empty:
                         print(f"Camera {self.camera_id} timeout waiting for global context")
                 
@@ -189,7 +221,7 @@ class SynchronizationManager:
                 camera_data = {}
                 camera_observations = {}
 
-                cameras_reported = set()
+
 
                 cameras_reported = set()
                 while len(cameras_reported) < self.config.num_cameras:
