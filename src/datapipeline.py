@@ -9,198 +9,415 @@ import time
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from collections import defaultdict
-global_df = pd.read_csv("orbit_simulation_1000_objects_positions.csv")
-global_sored = global_df.sort_values(by = ['object_id', 'time_step']).reset_index(drop=True)
-global_grouped = global_df.groupby('object_id')
+
+@dataclass
 class PipelineConfig:
-    sequence_length: int = 10
-    input_length: int = 30     # in_len
-    output_length: int = 20    # l - in_len
+    sequence_length: int = 50
+    input_length: int = 30     # t - historical sequence length
+    output_length: int = 20    # Not used in new design
     sync_interval: int = 5     # t - synchronization every t time steps
     batch_size: int = 32
     num_cameras: int = 4
     num_devices: int = 4
-    input_features: int = 6    # time_step, object_id, x, y, radius, angular_velocity, direction
-    position_features: int = 2  # x, y for output
+    position_features: int = 2  # x, y for input and output
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-class CameraDataset(Dataset):
-    """Dataset for individual camera sequences - generates sequences on-the-fly"""
-    def __init__(self, df: pd.DataFrame, config: PipelineConfig, camera_id: int):
-        self.df = df.sort_values(['object_id', 'time_step'])
-    
+class TrajectoryPredictionModel(nn.Module):
+    """Model that takes only x,y positions and predicts next t positions"""
+    def __init__(self, input_dim: int = 2, hidden_dim: int = 128, output_steps: int = 10):
+        super().__init__()
+        self.output_steps = output_steps
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True, num_layers=2)
+        self.fc = nn.Linear(hidden_dim, output_steps * input_dim)  # Predict t steps of (x,y)
+        
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, 2) - only x,y positions
+        lstm_out, _ = self.lstm(x)
+        # Use last timestep output for prediction
+        predictions = self.fc(lstm_out[:, -1, :])
+        # Reshape to (batch_size, output_steps, 2)
+        return predictions.view(-1, self.output_steps, 2)
+
+class ObjectHistoryManager:
+    """Manages historical position data for all objects"""
+    def __init__(self, config: PipelineConfig):
         self.config = config
-        self.camera_id = camera_id
+        # object_id -> list of (time_step, x, y)
+        self.object_positions = defaultdict(list)
+        self.max_history_length = config.sync_interval * 10  # Keep more history
         
-        # Create index mapping for efficient sequence generation
-        self.object_groups = {}
-        self.global_object_groups = {}
-        self.sequence_indices = []
+    def add_position(self, time_step: int, object_id: int, x: float, y: float):
+        """Add position observation for an object at a specific time step"""
+        self.object_positions[object_id].append((time_step, x, y))
         
-        # Group camera data by object_id
-        for object_id, group in self.df.groupby('object_id'):
-            group_sorted = group.sort_values('time_step').reset_index(drop=True)
-            self.object_groups[object_id] = group_sorted
+        # Keep only recent history, sorted by time
+        self.object_positions[object_id].sort(key=lambda x: x[0])
+        if len(self.object_positions[object_id]) > self.max_history_length:
+            self.object_positions[object_id] = self.object_positions[object_id][-self.max_history_length:]
+    
+    def get_position_sequence(self, object_id: int, start_time: int, end_time: int) -> Optional[torch.Tensor]:
+        """Get position sequence for object from start_time to end_time (inclusive)"""
+        if object_id not in self.object_positions:
+            return None
             
-            # Calculate valid sequence start positions
-            num_sequences = len(group_sorted) - self.config.sequence_length + 1
-            for i in range(num_sequences):
-                self.sequence_indices.append((object_id, i))
+        positions = self.object_positions[object_id]
+        sequence_data = []
         
-        # Group global data by object_id for target generation
-        for object_id, group in global_grouped:
-            group_sorted = group.sort_values('time_step').reset_index(drop=True)
-            self.global_object_groups[object_id] = group_sorted
+        for time_step, x, y in positions:
+            if start_time <= time_step <= end_time:
+                sequence_data.append([x, y])
+        
+        if len(sequence_data) == 0:
+            return None
+            
+        return torch.FloatTensor(sequence_data)
     
-    def __len__(self):
-        return len(self.sequence_indices)
-    
-    def __getitem__(self, idx):
-        """Generate sequence on-the-fly"""
-        object_id, start_idx = self.sequence_indices[idx]
-        group_data = self.object_groups[object_id]
+    def get_latest_position(self, object_id: int, time_step: int) -> Optional[Tuple[float, float]]:
+        """Get the latest known position for an object at or before time_step"""
+        if object_id not in self.object_positions:
+            return None
+            
+        positions = self.object_positions[object_id]
+        latest_pos = None
         
-        # Extract sequence data for input (from camera view)
-        sequence_data = group_data.iloc[start_idx:start_idx + self.config.sequence_length]
-        
-        # Input features: [time_step, object_id, x, y, radius, angular_velocity, direction]
-        input_features = sequence_data[['time_step', 'object_id', 'x', 'y', 'radius', 'angular_velocity', 'direction']].values
-        input_seq = torch.FloatTensor(input_features[:self.config.input_length])
-        
-        # Get time steps for the sequence
-        time_steps = sequence_data['time_step'].tolist()
-        output_time_steps = time_steps[self.config.input_length:]
-        
-        # Generate targets: ALL objects' positions at output time steps
-        all_object_targets = []
-        for time_step in output_time_steps:
-            # Get positions of ALL objects at this time step from global data
-            global_positions_at_t = []
-            for global_obj_id in sorted(self.global_object_groups.keys()):
-                global_group = self.global_object_groups[global_obj_id]
-                time_mask = global_group['time_step'] == time_step
+        for t, x, y in positions:
+            if t <= time_step:
+                latest_pos = (x, y)
+            else:
+                break
                 
-                if time_mask.any():
-                    obj_data = global_group[time_mask].iloc[0]
-                    global_positions_at_t.extend([obj_data['x'], obj_data['y']])
-                else:
-                    # If object not visible at this time step, use NaN or last known position
-                    global_positions_at_t.extend([float('nan'), float('nan')])
-            
-            all_object_targets.append(global_positions_at_t)
-        
-        # Convert to tensor: [output_length, total_objects * 2]  # 2 for x,y per object
-        output_seq = torch.FloatTensor(all_object_targets)
-        
-        return input_seq, output_seq, object_id, time_steps
+        return latest_pos
+
 class CameraProcessor:
     def __init__(self, camera_id: int, df: pd.DataFrame, config: PipelineConfig):
         self.camera_id = camera_id
         self.config = config
-        self.dataset = CameraDataset(df, config, camera_id)
-        self.dataloader = DataLoader(self.dataset, batch_size=config.batch_size, shuffle=True)
-
-
+        # Only keep necessary columns: time_step, object_id, x, y
+        self.df = df[['time_step', 'object_id', 'x', 'y']].sort_values(['time_step', 'object_id'])
+        
         self.trajectory_model = TrajectoryPredictionModel(
-            sequence_input_dim=config.input_features,
-            output_dim=config.position_features
-        )
-        self.outgoing_queue = queue.Queue()  # Send compressed data to sync manager
-        self.incoming_queue = queue.Queue()  # Receive global context from sync manager
-
+            input_dim=2,  # Only x, y
+            output_steps=config.sync_interval
+        ).to(config.device)
+        
+        # Communication queues
+        self.outgoing_queue = queue.Queue()  # Send predictions to sync manager
+        self.incoming_queue = queue.Queue()  # Receive other cameras' predictions
+        
         self.current_time_step = 0
-        self.local_predictions = {}
-
-    def extract_time_step_observations(self, time_step: int) -> Dict[int, np.ndarray]:
-        """Extract observations for a specific time step."""
+        self.object_history = ObjectHistoryManager(config)
+        
+        # Initialize history with all available data up to current time
+        self._initialize_history()
+        
+    def _initialize_history(self):
+        """Initialize object history with available data"""
+        for _, row in self.df.iterrows():
+            self.object_history.add_position(
+                int(row['time_step']), 
+                int(row['object_id']), 
+                float(row['x']), 
+                float(row['y'])
+            )
+    
+    def get_objects_in_fov(self, time_step: int) -> List[int]:
+        """Get object IDs that are in this camera's FOV at given time step"""
         mask = self.df['time_step'] == time_step
         time_step_data = self.df[mask]
-        if (len(time_step_data) > 0 ):
-            obs = time_step_data[['object_id', 'x', 'y', 'radius', 'angular_velocity', 'direction']].values
-            return torch.FloatTensor(obs)
-        else:
-            return torch.empty(0, self.config.input_features)
-    def process_sequence(self):
-        local_predictions = []
-        for batch in self.dataloader:
-            input_seq, output_seq, object_ids, time_steps = batch
-            input_seq = input_seq.to(self.config.device)
-            output_seq = output_seq.to(self.config.device)
-
-            # Predict trajectory using the model
-            # predictions = self.trajectory_model(input_seq)
-            # local_predictions.append((object_ids, predictions.cpu().numpy(), time_steps))
-
-            with torch.inference_mode():
-                predictions = self.trajectory_model(input_seq)
-                local_predictions.append((predictions, object_ids, time_steps))
-
-            return local_predictions
+        return time_step_data['object_id'].tolist()
+    
+    def get_all_known_objects(self) -> List[int]:
+        """Get all object IDs that this camera has ever seen"""
+        return list(self.object_history.object_positions.keys())
+    
+    def predict_object_trajectory(self, object_id: int, current_time: int, 
+                                use_shared_data_at_T: Optional[Dict] = None) -> Optional[torch.Tensor]:
+        """
+        Predict trajectory for a single object for next t time steps
         
+        Args:
+            object_id: ID of object to predict
+            current_time: Current time step T
+            use_shared_data_at_T: Shared position data at time T for objects not in FOV
+        """
+        # For objects in our FOV: use T-t to T-1 + our observation at T
+        if object_id in self.get_objects_in_fov(current_time):
+            # Get historical sequence from T-t to T-1
+            start_time = current_time - self.config.sync_interval
+            end_time = current_time - 1
+            historical_seq = self.object_history.get_position_sequence(object_id, start_time, end_time)
+            
+            # Get our current observation at T
+            current_obs = self.object_history.get_position_sequence(object_id, current_time, current_time)
+            
+            if historical_seq is not None and current_obs is not None:
+                # Combine historical + current
+                full_sequence = torch.cat([historical_seq, current_obs], dim=0)
+            elif current_obs is not None:
+                # Only current observation available
+                full_sequence = current_obs
+            else:
+                return None
+                
+        else:
+            # For objects NOT in our FOV: use T-t-1 to T-1 + shared data at T
+            start_time = current_time - self.config.sync_interval - 1
+            end_time = current_time - 1
+            historical_seq = self.object_history.get_position_sequence(object_id, start_time, end_time)
+            
+            # Use shared position data at T
+            if use_shared_data_at_T and object_id in use_shared_data_at_T:
+                shared_pos = use_shared_data_at_T[object_id]  # (x, y)
+                current_obs = torch.FloatTensor([[shared_pos[0], shared_pos[1]]])
+                
+                if historical_seq is not None:
+                    full_sequence = torch.cat([historical_seq, current_obs], dim=0)
+                else:
+                    full_sequence = current_obs
+            else:
+                return None
+        
+        # Ensure we have enough data points
+        if len(full_sequence) < self.config.sync_interval:
+            # Pad with the first available position
+            padding_needed = self.config.sync_interval - len(full_sequence)
+            first_pos = full_sequence[0].unsqueeze(0).repeat(padding_needed, 1)
+            full_sequence = torch.cat([first_pos, full_sequence], dim=0)
+        elif len(full_sequence) > self.config.sync_interval:
+            # Take the last t positions
+            full_sequence = full_sequence[-self.config.sync_interval:]
+        
+        # Predict next t time steps
+        input_seq = full_sequence.unsqueeze(0).to(self.config.device)  # Add batch dimension
+        
+        with torch.no_grad():
+            predictions = self.trajectory_model(input_seq)  # Shape: (1, t, 2)
+            
+        return predictions.squeeze(0).cpu()  # Shape: (t, 2)
+    
+    def predict_for_objects_in_fov(self, time_step: int) -> Dict[int, Dict]:
+        """Predict trajectories for objects currently in FOV"""
+        objects_in_fov = self.get_objects_in_fov(time_step)
+        predictions = {}
+        
+        for object_id in objects_in_fov:
+            trajectory_pred = self.predict_object_trajectory(object_id, time_step)
+            if trajectory_pred is not None:
+                # Get current position for sharing
+                current_pos = self.object_history.get_position_sequence(object_id, time_step, time_step)
+                if current_pos is not None:
+                    predictions[object_id] = {
+                        'object_id': object_id,  # Include object ID for matching
+                        'current_position': current_pos.squeeze().tolist(),  # [x, y]
+                        'current_time': time_step,  # Time when this position was observed
+                        'future_predictions': trajectory_pred.tolist(),  # [[x1,y1], [x2,y2], ...]
+                        'prediction_start_time': time_step + 1,
+                        'prediction_end_time': time_step + self.config.sync_interval
+                    }
+        
+        return predictions
+    
+    def predict_for_all_objects(self, current_time: int, shared_data_time: int, 
+                              shared_positions_at_T: Dict[int, Tuple[float, float]]) -> Dict[int, torch.Tensor]:
+        """
+        Predict trajectories for ALL objects with temporal alignment
+        
+        Args:
+            current_time: Current time T+k when making predictions
+            shared_data_time: Original time T when shared data was sent
+            shared_positions_at_T: Dict of object_id -> (x, y) positions at time T from other cameras
+        """
+        all_predictions = {}
+        all_known_objects = self.get_all_known_objects()
+        
+        # Add objects from shared data that we might not know about
+        for obj_id in shared_positions_at_T.keys():
+            if obj_id not in all_known_objects:
+                all_known_objects.append(obj_id)
+        
+        k = current_time - shared_data_time  # Time offset
+        print(f"Camera {self.camera_id}: Predicting at T+{k} using data from T={shared_data_time}")
+        
+        for object_id in all_known_objects:
+            # Use temporal alignment for sequence building
+            aligned_sequence = self.get_temporal_aligned_sequence(
+                object_id, current_time, shared_data_time
+            )
+            
+            if aligned_sequence is not None:
+                # Make prediction using the aligned sequence
+                input_seq = aligned_sequence.unsqueeze(0).to(self.config.device)
+                
+                with torch.no_grad():
+                    predictions = self.trajectory_model(input_seq)  # Shape: (1, t, 2)
+                    all_predictions[object_id] = predictions.squeeze(0).cpu()  # Shape: (t, 2)
+        
+        return all_predictions
+    
+    def update_history_with_shared_data(self, shared_data: Dict[int, Dict[int, Dict]], 
+                                       shared_time: int, current_time: int):
+        """
+        Update object history with shared position data from other cameras
+        Handles temporal alignment when shared data arrives at different times
+        
+        Args:
+            shared_data: Data shared by other cameras
+            shared_time: Time T when the data was originally shared
+            current_time: Current time T+k when we're processing this data
+        """
+        print(f"Camera {self.camera_id}: Processing shared data from time {shared_time} at current time {current_time}")
+        
+        for camera_id, camera_predictions in shared_data.items():
+            if camera_id != self.camera_id:  # Don't process own data
+                for object_id, pred_data in camera_predictions.items():
+                    # Extract object info with proper ID matching
+                    obj_id = pred_data.get('object_id', object_id)  # Use explicit object_id if available
+                    pos = pred_data['current_position']  # [x, y]
+                    pos_time = pred_data.get('current_time', shared_time)  # Time when position was observed
+                    
+                    # Add the position from other camera at the correct timestamp
+                    self.object_history.add_position(pos_time, obj_id, pos[0], pos[1])
+                    
+                    print(f"  Added position for object {obj_id} at time {pos_time}: ({pos[0]:.2f}, {pos[1]:.2f})")
+    
+    def get_temporal_aligned_sequence(self, object_id: int, prediction_time: int, 
+                                    shared_data_time: int) -> Optional[torch.Tensor]:
+        """
+        Get temporally aligned sequence for prediction when shared data arrives at different times
+        
+        Args:
+            object_id: Object to predict for
+            prediction_time: Current time T+k when making prediction
+            shared_data_time: Original time T when shared data was sent
+        
+        Returns:
+            Sequence of positions for prediction, properly aligned temporally
+        """
+        k = prediction_time - shared_data_time  # Time offset
+        
+        if k < 0:
+            # Shared data is from the future - shouldn't happen in normal operation
+            print(f"Warning: Shared data from future for object {object_id}")
+            return None
+        
+        if k >= self.config.sync_interval:
+            # Shared data is too old to be useful
+            print(f"Warning: Shared data too old for object {object_id} (k={k})")
+            return None
+        
+        # We need t total time steps for prediction
+        # Use (k+1) new data points from T to T+k and (t-k-1) old data points
+        new_data_start = shared_data_time
+        new_data_end = prediction_time
+        old_data_start = shared_data_time - self.config.sync_interval + k
+        old_data_end = shared_data_time - 1
+        
+        # Get old data sequence (T-t+k to T-1)
+        old_sequence = None
+        if old_data_start <= old_data_end:
+            old_sequence = self.object_history.get_position_sequence(
+                object_id, old_data_start, old_data_end
+            )
+        
+        # Get new data sequence (T to T+k)
+        new_sequence = self.object_history.get_position_sequence(
+            object_id, new_data_start, new_data_end
+        )
+        
+        # Combine sequences
+        if old_sequence is not None and new_sequence is not None:
+            full_sequence = torch.cat([old_sequence, new_sequence], dim=0)
+        elif new_sequence is not None:
+            full_sequence = new_sequence
+        elif old_sequence is not None:
+            full_sequence = old_sequence
+        else:
+            return None
+        
+        # Ensure we have exactly t time steps
+        target_length = self.config.sync_interval
+        if len(full_sequence) < target_length:
+            # Pad with first position
+            padding_needed = target_length - len(full_sequence)
+            first_pos = full_sequence[0].unsqueeze(0).repeat(padding_needed, 1)
+            full_sequence = torch.cat([first_pos, full_sequence], dim=0)
+        elif len(full_sequence) > target_length:
+            # Take the most recent t positions
+            full_sequence = full_sequence[-target_length:]
+        
+        print(f"  Object {object_id}: Using {len(old_sequence) if old_sequence is not None else 0} old + {len(new_sequence) if new_sequence is not None else 0} new data points")
+        
+        return full_sequence
+    
     def run_camera_thread(self):
         """Main processing loop for camera thread"""
         print(f"Camera {self.camera_id} thread started")
         
         while True:
             try:
-                # Process local sequences
-                local_preds = self.process_sequences()
-                self.local_predictions = local_preds
-                
                 # Check if it's time to synchronize
                 if self.current_time_step % self.config.sync_interval == 0:
-                    # Extract observations at current time step
-                    observations = self.extract_time_step_observations(self.current_time_step)
+                    print(f"Camera {self.camera_id} synchronizing at time {self.current_time_step}")
                     
-                    # Send to synchronization manager
+                    # Step 1: Predict for objects in our FOV from T to T+t
+                    # Only share predictions for objects in our FOV
+                    our_fov_predictions = self.predict_for_objects_in_fov(self.current_time_step)
+                    
+                    # Step 2: Send only our FOV objects' predictions to sync manager
                     self.outgoing_queue.put({
                         'camera_id': self.camera_id,
                         'time_step': self.current_time_step,
-                        'observations': observations,
-                        'local_predictions': local_preds
+                        'predictions': our_fov_predictions,
+                        'objects_in_fov': list(our_fov_predictions.keys())
                     })
                     
-                    # Wait for global context and use it
+                    # Step 3: Wait for shared predictions from other cameras
                     try:
-                        global_data = self.incoming_queue.get(timeout=10.0)
-                        global_context = global_data['global_context']
-                        all_predictions = global_data['all_predictions']
+                        shared_data = self.incoming_queue.get(timeout=10.0)
+                        all_camera_predictions = shared_data['all_camera_predictions']
                         
-                        print(f"Camera {self.camera_id} received global context at time {self.current_time_step}")
+                        print(f"Camera {self.camera_id} received shared predictions from {len(all_camera_predictions)} cameras")
                         
-                        # TODO: Use global_context and all_predictions for further processing
-                        # This is where you'd update local models or store final predictions
+                        # Step 4: Update our history with shared position data
+                        shared_time = shared_data['sync_time_step']
+                        self.update_history_with_shared_data(
+                            all_camera_predictions, shared_time, self.current_time_step
+                        )
+                        
+                        # Step 5: Extract current positions at T from shared data
+                        shared_positions_at_T = {}
+                        for camera_id, camera_preds in all_camera_predictions.items():
+                            if camera_id != self.camera_id:
+                                for obj_id, pred_data in camera_preds.items():
+                                    # Use explicit object_id for proper matching
+                                    actual_obj_id = pred_data.get('object_id', obj_id)
+                                    shared_positions_at_T[actual_obj_id] = tuple(pred_data['current_position'])
+                        
+                        # Step 6: Now predict for ALL objects with temporal alignment
+                        all_predictions = self.predict_for_all_objects(
+                            self.current_time_step, 
+                            shared_time,
+                            shared_positions_at_T
+                        )
+                        
+                        print(f"Camera {self.camera_id} generated predictions for {len(all_predictions)} objects for next interval")
                         
                     except queue.Empty:
-                        print(f"Camera {self.camera_id} timeout waiting for global context")
+                        print(f"Camera {self.camera_id} timeout waiting for shared predictions")
                 
                 self.current_time_step += 1
                 time.sleep(0.1)  # Simulate processing time
                 
             except Exception as e:
                 print(f"Error in camera {self.camera_id}: {e}")
+                import traceback
+                traceback.print_exc()
                 break
 
-    
 class SynchronizationManager:
-    """Manages synchronization and global model coordination"""
-    def __init__(self, config: PipelineConfig, total_objects: int):
+    """Manages synchronization and sharing of predictions between cameras"""
+    def __init__(self, config: PipelineConfig):
         self.config = config
-        self.total_objects = total_objects
-        # Global models
-        self.compression_model = CompressionModel(
-            input_dim=config.input_features,
-            compressed_dim=128  # TODO: Make configurable
-        )
-        
-        self.integration_model = GlobalIntegrationModel(
-            local_pred_dim=config.position_features,
-            compressed_dim=128,
-            output_dim=config.position_features,
-            total_objects=total_objects
-        )
-        
-        # Camera processors
         self.camera_processors = {}
         self.camera_queues = {}
 
@@ -218,76 +435,72 @@ class SynchronizationManager:
 
         while True:
             try:
-                camera_data = {}
-                camera_observations = {}
-
-
-
+                # Collect predictions from all cameras for their FOV objects only
+                camera_predictions = {}
                 cameras_reported = set()
-                while len(cameras_reported) < self.config.num_cameras:
+                
+                print(f"Sync manager waiting for cameras at time {current_sync_time}")
+                
+                # Wait for all cameras to report their FOV predictions
+                timeout_counter = 0
+                while len(cameras_reported) < len(self.camera_processors) and timeout_counter < 50:
                     for camera_id, camera_queue in self.camera_queues.items():
                         if camera_id not in cameras_reported:
                             try:
-                                data = camera_queue.get(timeout=1.0)
+                                data = camera_queue.get(timeout=0.1)
                                 if data['time_step'] == current_sync_time:
-                                    camera_data[camera_id] = data
-                                    camera_observations[camera_id] = data['observations']
+                                    camera_predictions[camera_id] = data['predictions']
                                     cameras_reported.add(camera_id)
+                                    print(f"Received predictions from camera {camera_id} for {len(data['predictions'])} objects in FOV")
                             except queue.Empty:
-                                continue
-                print(f"Synchronization at time step {current_sync_time}")
+                                pass
+                    timeout_counter += 1
                 
-                # Compress global observations using compression model
-                global_context = self.compression_model(camera_observations)
-                
-                # Process each camera's local predictions with global context
-                for camera_id, data in camera_data.items():
-                    local_preds = data['local_predictions']
-                # Integrate local predictions with global context
-                    if local_preds:
-                        # Extract prediction tensors (simplified)
-                        pred_tensors = [pred[0] for pred in local_preds]
-                        if pred_tensors:
-                            combined_preds = torch.cat(pred_tensors, dim=0)
-                            
-                            # Generate global predictions for all objects
-                            all_object_predictions = self.integration_model(combined_preds, global_context)
-                            
-                            # Send global context back to camera
-                            processor = self.camera_processors[camera_id]
+                if len(cameras_reported) > 0:
+                    print(f"Synchronization at time {current_sync_time}: {len(cameras_reported)} cameras reported")
+                    
+                    # Share all camera predictions with each camera
+                    for camera_id, processor in self.camera_processors.items():
+                        try:
                             processor.incoming_queue.put({
-                                'global_context': global_context,
-                                'all_predictions': all_object_predictions,
-                                'time_step': current_sync_time
-                            })
+                                'all_camera_predictions': camera_predictions,
+                                'sync_time_step': current_sync_time
+                            }, timeout=1.0)
+                        except queue.Full:
+                            print(f"Warning: Camera {camera_id} incoming queue is full")
+                else:
+                    print(f"No cameras reported at time {current_sync_time}")
                 
                 current_sync_time += self.config.sync_interval
+                
             except Exception as e:
                 print(f"Error in synchronization manager: {e}")
+                import traceback
+                traceback.print_exc()
                 break
+
 class TrajectoryPredictionPipeline:
     """Main pipeline orchestrator"""
-    def __init__(self, config: PipelineConfig, total_objects: int = 1000):
+    def __init__(self, config: PipelineConfig):
         self.config = config
-        self.total_objects = total_objects
-        self.sync_manager = SynchronizationManager(config, total_objects)
+        self.sync_manager = SynchronizationManager(config)
         self.camera_threads = []
 
     def add_camera_data(self, camera_id: int, df: pd.DataFrame):
         """Add data for a specific camera"""
         processor = self.sync_manager.add_camera(camera_id, df)
         return processor
+    
     def start_pipeline(self):
         """Start all camera threads and synchronization"""
         # Start synchronization manager in separate thread
         sync_thread = threading.Thread(target=self.sync_manager.synchronization_loop)
         sync_thread.daemon = True
         sync_thread.start()
+        
+        # Start camera processor threads
         for camera_id, processor in self.sync_manager.camera_processors.items():
-            camera_thread = threading.Thread(
-                target=processor.run_camera_thread,
-                args=(self.sync_manager,)
-            )
+            camera_thread = threading.Thread(target=processor.run_camera_thread)
             camera_thread.daemon = True
             camera_thread.start()
             self.camera_threads.append(camera_thread)
@@ -297,12 +510,11 @@ class TrajectoryPredictionPipeline:
     
     def get_models(self):
         """Get access to models for training/inference"""
-        return {
-            'compression_model': self.sync_manager.compression_model,
-            'trajectory_model': list(self.sync_manager.camera_processors.values())[0].trajectory_model,
-            'integration_model': self.sync_manager.integration_model
-        }
-
+        models = {}
+        if self.sync_manager.camera_processors:
+            first_processor = list(self.sync_manager.camera_processors.values())[0]
+            models['trajectory_model'] = first_processor.trajectory_model
+        return models
 
 # Example usage and testing
 if __name__ == "__main__":
@@ -312,29 +524,63 @@ if __name__ == "__main__":
         input_length=30,
         output_length=20,
         sync_interval=5,
-        batch_size=32
+        batch_size=32,
+        num_cameras=4
     )
     
     # Create pipeline
     pipeline = TrajectoryPredictionPipeline(config)
     
-    # Example: Load your camera data (replace with actual DataFrames)
-    # df1, df2, df3, df4 = load_camera_data()  # Your camera dataframes
+    def create_dummy_camera_data(camera_id: int, num_objects: int = 10, num_timesteps: int = 100):
+        """Create dummy circular motion data - simplified to only necessary columns"""
+        data = []
+        
+        # Each camera sees some unique objects and some shared objects
+        base_objects = list(range(camera_id * (num_objects // 2), (camera_id + 1) * (num_objects // 2)))
+        shared_objects = list(range(num_objects, num_objects + 5))  # 5 shared objects across all cameras
+        all_objects = base_objects + shared_objects
+        
+        for obj_id in all_objects:
+            radius = np.random.uniform(5, 20)
+            angular_velocity = np.random.uniform(0.1, 0.5)
+            center_x = np.random.uniform(-50, 50)
+            center_y = np.random.uniform(-50, 50)
+            
+            for t in range(num_timesteps):
+                angle = angular_velocity * t
+                x = center_x + radius * np.cos(angle)
+                y = center_y + radius * np.sin(angle)
+                
+                # Only keep essential columns
+                data.append({
+                    'time_step': t,
+                    'object_id': obj_id,
+                    'x': x,
+                    'y': y
+                })
+        
+        return pd.DataFrame(data)
     
-    # Add camera data (uncomment when you have real data)
-    # pipeline.add_camera_data(0, df1)
-    # pipeline.add_camera_data(1, df2)
-    # pipeline.add_camera_data(2, df3)
-    # pipeline.add_camera_data(3, df4)
+    # Create dummy data for each camera with overlapping objects
+    print("Creating dummy data for testing...")
+    for camera_id in range(config.num_cameras):
+        dummy_df = create_dummy_camera_data(camera_id)
+        pipeline.add_camera_data(camera_id, dummy_df)
+        print(f"Camera {camera_id} loaded with {len(dummy_df)} observations")
     
     # Start pipeline
-    # sync_thread, camera_threads = pipeline.start_pipeline()
+    print("Starting pipeline...")
+    sync_thread, camera_threads = pipeline.start_pipeline()
     
-    # Get models for training
-    # models = pipeline.get_models()
+    # Let it run for a few seconds for demonstration
+    time.sleep(15)
     
-    print("Pipeline scaffolding created successfully!")
-    print("TODO: Implement the three model architectures:")
-    print("1. CompressionModel - compress multi-camera observations")
-    print("2. TrajectoryPredictionModel - predict trajectories from sequences")
-    print("3. GlobalIntegrationModel - integrate local predictions with global context")
+    print("Pipeline demonstration completed!")
+    print("\nKey features implemented:")
+    print("1. Data reduced to only: time_step, object_id, x, y")
+    print("2. Model takes only x,y positions as input")
+    print("3. Each camera shares only FOV objects' predictions")
+    print("4. For FOV objects: uses T-t to T-1 + current T observation")
+    print("5. For non-FOV objects: uses T-t-1 to T-1 + shared T position") 
+    print("6. All cameras predict for ALL objects but share only FOV objects")
+    print("7. Proper object ID tracking and position sharing")
