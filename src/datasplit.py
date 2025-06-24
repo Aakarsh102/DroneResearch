@@ -12,12 +12,15 @@ def create_camera_data():
     df2 = df[(df["x"] < 0)  & (df["y"] >= 0)]
     df3 = df[(df["x"] < 0)  & (df["y"] < 0)]
     df4 = df[(df["x"] >= 0) & (df["y"] < 0)]
-
+    df1 = df1[['time_step', 'object_id', 'x', 'y']]
+    df2 = df2[['time_step', 'object_id', 'x', 'y']]
+    df3 = df3[['time_step', 'object_id', 'x', 'y']]
+    df4 = df4[['time_step', 'object_id', 'x', 'y']]
     df1.to_csv("camera_data_1.csv", index=False)
     df2.to_csv("camera_data_2.csv", index=False)
     df3.to_csv("camera_data_3.csv", index=False)
     df4.to_csv("camera_data_4.csv", index=False)
 
 if __name__ == "__main__":
-    # create_camera_data()
+    create_camera_data()
     print("Camera data created successfully.")

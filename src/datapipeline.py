@@ -44,7 +44,7 @@ class ObjectHistoryManager:
         self.config = config
         # object_id -> list of (time_step, x, y)
         self.object_positions = defaultdict(list)
-        self.max_history_length = config.sync_interval * 10  # Keep more history
+        self.max_history_length = config.sync_interval * 4  # Keep more history
         
     def add_position(self, time_step: int, object_id: int, x: float, y: float):
         """Add position observation for an object at a specific time step"""
@@ -97,7 +97,7 @@ class CameraProcessor:
         
         self.trajectory_model = TrajectoryPredictionModel(
             input_dim=2,  # Only x, y
-            output_steps=config.sync_interval
+            output_steps=config.output_length
         ).to(config.device)
         
         # Communication queues
@@ -190,7 +190,7 @@ class CameraProcessor:
         # Predict next t time steps
         input_seq = full_sequence.unsqueeze(0).to(self.config.device)  # Add batch dimension
         
-        with torch.no_grad():
+        with torch.inference_mode():
             predictions = self.trajectory_model(input_seq)  # Shape: (1, t, 2)
             
         return predictions.squeeze(0).cpu()  # Shape: (t, 2)
@@ -248,7 +248,7 @@ class CameraProcessor:
                 # Make prediction using the aligned sequence
                 input_seq = aligned_sequence.unsqueeze(0).to(self.config.device)
                 
-                with torch.no_grad():
+                with torch.inference_mode():
                     predictions = self.trajectory_model(input_seq)  # Shape: (1, t, 2)
                     all_predictions[object_id] = predictions.squeeze(0).cpu()  # Shape: (t, 2)
         
