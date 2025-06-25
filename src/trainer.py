@@ -120,23 +120,26 @@ class PositionEncoder(nn.Module):
         return x + self.pe[:, :seq]
     
 class ImprovedTrajectoryModel(nn.Module):
-    def __init__(self, input_dim: int = 2, hidden_dim: int = 32, fnn_dim: int = 128, output_len:int = 10, num_layers:int = 2):
-        super().__init__()
-        self.embed = nn.Linear(in_features=input_dim, out_features=hidden_dim)
-        # Hardcoded sequence length for simplicity here
-        self.position_encoder = PositionEncoder(hidden_dim=hidden_dim, seq_len=5)
-        mask = create_causal_mask(output_len, 'cuda' if torch.cuda.is_available() else 'cpu')
-        self.transformer = nn.TransformerDecoderLayer(d_model = hidden_dim, nhead=8, dim_feedforward=
-                                                      fnn_dim, dropout=0.1, activation='relu', tgt_mask=mask)
+    
+    
+# class ImprovedTrajectoryModel(nn.Module):
+#     def __init__(self, input_dim: int = 2, hidden_dim: int = 32, fnn_dim: int = 128, output_len:int = 10, num_layers:int = 2):
+#         super().__init__()
+#         self.embed = nn.Linear(in_features=input_dim, out_features=hidden_dim)
+#         # Hardcoded sequence length for simplicity here
+#         self.position_encoder = PositionEncoder(hidden_dim=hidden_dim, seq_len=5)
+#         self.mask = create_causal_mask(output_len, 'cuda' if torch.cuda.is_available() else 'cpu')
+#         self.transformer = nn.TransformerDecoderLayer(d_model = hidden_dim, nhead=8, dim_feedforward=
+#                                                       fnn_dim, dropout=0.1, activation='relu')
         
-        self.transformer_decoder = nn.TransformerDecoder(self.transformer, num_layers=num_layers)
-        self.fc_out = nn.Linear(in_features=hidden_dim, out_features=output_len * input_dim)
+#         self.transformer_decoder = nn.TransformerDecoder(self.transformer, num_layers=num_layers)
+#         self.fc_out = nn.Linear(in_features=hidden_dim, out_features=output_len * input_dim)
 
-    def forward(self, x):
-        x = self.embed(x)  # x shape: (batch_size, seq_len, input_dim)
-        x = self.position_encoder(x)  # Apply positional encoding
-        x = x.permute(1, 0, 2)  # Change shape to (seq_len, batch_size, hidden_dim) for Transformer
-        x = self.transformer_decoder(x, x)  # Transformer decoder expects two inputs
+#     def forward(self, x):
+#         x = self.embed(x)  # x shape: (batch_size, seq_len, input_dim)
+#         x = self.position_encoder(x)  # Apply positional encoding
+#         x = x.permute(1, 0, 2)  # Change shape to (seq_len, batch_size, hidden_dim) for Transformer
+#         x = self.transformer_decoder(x,0, tgt_mask = self.mask)  # Transformer decoder expects two inputs
 # class ImprovedTrajectoryModel(nn.Module):
 #     """Improved trajectory prediction model with better architecture"""
     
