@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
+# from decoder_only_model import ImprovedTrajectoryModel
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
@@ -119,8 +120,8 @@ class PositionEncoder(nn.Module):
         seq = x.size(1)
         return x + self.pe[:, :seq]
     
-class ImprovedTrajectoryModel(nn.Module):
-    
+
+
     
 # class ImprovedTrajectoryModel(nn.Module):
 #     def __init__(self, input_dim: int = 2, hidden_dim: int = 32, fnn_dim: int = 128, output_len:int = 10, num_layers:int = 2):

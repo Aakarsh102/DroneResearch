@@ -1,28 +1,28 @@
 {
-  "total_objects": 100,
+  "total_objects": 150,
   "total_time_steps": 200,
-  "total_position_records": 20000,
-  "total_camera_events": 1488,
+  "total_position_records": 30000,
+  "total_camera_events": 2266,
   "events_per_camera": {
     "Camera_Q1": {
-      "total_events": 372,
-      "enter_events": 198,
-      "exit_events": 174
+      "total_events": 569,
+      "enter_events": 299,
+      "exit_events": 270
     },
     "Camera_Q2": {
-      "total_events": 384,
-      "enter_events": 204,
-      "exit_events": 180
+      "total_events": 562,
+      "enter_events": 297,
+      "exit_events": 265
     },
     "Camera_Q3": {
-      "total_events": 371,
-      "enter_events": 195,
-      "exit_events": 176
+      "total_events": 557,
+      "enter_events": 300,
+      "exit_events": 257
     },
     "Camera_Q4": {
-      "total_events": 361,
-      "enter_events": 197,
-      "exit_events": 164
+      "total_events": 578,
+      "enter_events": 312,
+      "exit_events": 266
     }
   }
 }

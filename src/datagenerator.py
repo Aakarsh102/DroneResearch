@@ -244,7 +244,7 @@ class OrbitSimulation:
 # Example usage
 if __name__ == "__main__":
     # Create and run simulation
-    sim = OrbitSimulation(num_objects=100, time_steps=200)
+    sim = OrbitSimulation(num_objects=150, time_steps=200)
     sim.run_simulation()
     
     # Get datasets
