@@ -6,3 +6,7 @@ camera_data_3.csv
 camera_data_4.csv
 orbit_simulation_1000_objects_positions.csv
 src/.env
+argoverse-api/
+data/
+vfl/
+argo396/
