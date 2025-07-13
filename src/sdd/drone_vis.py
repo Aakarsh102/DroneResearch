@@ -37,7 +37,7 @@ class DroneVisualizer:
             save_path: Optional path to save the visualization
         """
         # Load reference image
-        ref_path = self.dataset_path / "annotations" / location / "video4" / "reference.jpg"
+        ref_path = self.dataset_path / "annotations" / location / "video2" / "reference.jpg"
         if not ref_path.exists():
             # Try other video directories
             location_path = self.dataset_path / "annotations" / location
@@ -241,12 +241,12 @@ def main():
 
 if __name__ == "__main__":
     # main()
-    location = "quad"
+    location = "hyang"
     drone_positions = [
-        (500, 250),
-        (300, 800),   # drone2
-        (1150, 750),   # drone3
-        (1500, 300)
+        (700, 350),
+        (1050, 1025),
+        (650, 1500),
+        (350, 1025),
     ]
     fov_radius = 210
     vis = DroneVisualizer("stanford_data/archive")
