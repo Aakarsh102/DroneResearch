@@ -207,8 +207,8 @@ def train(
     epochs: int = 20,
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ):
-    d_set = AgentSequenceDataset("~/Desktop/square_stanford_data", "stanford_data/archive", 10, 10)
-    train_dataloader = DataLoader(d_set, shuffle=True, pin_memory=True, num_workers=4)
+    d_set = AgentSequenceDataset(drone_data_root=drone_data_root, original_dataset_root=original_dataset_root, classes=classes, T_past=T_past, T_future=T_future)
+    train_dataloader = DataLoader(d_set, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
     model = TrajectoryModel(10, 10, d_model = 64).to(device)
     optimizer = torch.optim.AdamW(model.parameters, lr = lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, eta_min = 1e-5)
