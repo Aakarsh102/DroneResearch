@@ -48,12 +48,14 @@ class AgentSequenceDataset(Dataset):
 
         # Build samples using original dataset for full tracks
         for loc in os.listdir(original_dataset_root + "/annotations"):
-            if loc == 'hyang': continue
+            if loc == 'hyang' or loc == ".DS_Store": continue
+            if not os.path.isdir(loc_path):            # ← skip files like .DS_Store
+                continue
             for vid in os.listdir(os.path.join(original_dataset_root,"annotations",loc)):
                 # load original annotations
                 orig_file = os.path.join(original_dataset_root,"annotations",loc,vid,"annotations.txt")
                 if not os.path.isfile(orig_file): continue
-                odf = pd.read_csv(orig_file, sep='\s+', header=None,
+                odf = pd.read_csv(orig_file, sep=' ', header=None,
                                   names=['trackId','xmin','ymin','xmax','ymax',
                                          'frame','lost','occluded','generated','label'])
                 # compute centers
@@ -107,20 +109,21 @@ class AgentSequenceDataset(Dataset):
             'obs_mask': torch.from_numpy(s['obs_mask']), # (T_past,)
             'future':   torch.from_numpy(s['future']),   # (T_future,2)
             'occ_mask': torch.from_numpy(s['occ_mask']), # (T_future,)
-            'label':    torch.tensor(s['label'],dtype=torch.long)
+            'label':    torch.tensor(s['label'])
         }
 
-
+num_classes = 6
 class TrajectoryModel(nn.Module):
     """
     Transformer encoder + GRU-based autoregressive decoder predicting
     future Gaussian (mu, logvar) per timestep, with mask embedding.
     """
-    def __init__(self, T_past, T_future, d_model=128, nhead=4, num_layers=3):
+    def __init__(self, T_past, T_future, labels, d_model=128, nhead=4, num_layers=3):
         super().__init__()
         self.T_past = T_past
         self.T_future = T_future
         self.d_model = d_model
+        self.labels = labels
 
         # input projection for coords
         self.input_proj = nn.Linear(2, d_model)
@@ -129,6 +132,7 @@ class TrajectoryModel(nn.Module):
         self.e_miss = nn.Parameter(torch.randn(d_model))
         # positional embeddings
         self.pos_emb = nn.Parameter(torch.randn(T_past, d_model))
+        self.label_emb = nn.Embedding(num_classes, d_model)
 
         # transformer encoder
         enc_layer = nn.TransformerEncoderLayer(d_model, nhead, d_model*4, dropout=0.1)
@@ -143,16 +147,22 @@ class TrajectoryModel(nn.Module):
         # past: (B, T_past, 2), obs_mask: (B, T_past)
         B = past.size(0)
         # embed coords
-        x = self.input_proj(past)  # (B,T_past,d)
+        x = self.input_proj(past)  # (B,T_past,d_model)
         # add mask embedding
         mask_embed = obs_mask.unsqueeze(-1)*(self.e_obs) + (1-obs_mask).unsqueeze(-1)*(self.e_miss)
         x = x + mask_embed
         # add pos emb
         x = x + self.pos_emb.unsqueeze(0)
+
+        # label encoding 
+        lbl = self.label_emb(self.labels.to(x.device)) 
+        x = x + lbl
+
+
         # encoder
-        x_t = x.permute(1,0,2)     # (T_past,B,d)
-        h_enc = self.encoder(x_t)  # (T_past,B,d)
-        h = h_enc.mean(0)          # (B,d)
+        x_t = x.permute(1,0,2)     # (T_past,B,d_model)
+        h_enc = self.encoder(x_t)  # (T_past,B,d_model)
+        h = h_enc.mean(0)          # (B,d_model)
 
         # autoregressive decode
         mu_seq, logvar_seq = [], []
@@ -163,7 +173,10 @@ class TrajectoryModel(nn.Module):
                 coord = future[:,t]             # (B,2)
                 inp = self.input_proj(coord)    # teacher forcing
             else:
-                inp = mu_seq[-1]                # previous mu
+                if t == 0:
+                    inp = self.input_proj(past[:, -1])
+                else:
+                    inp = self.input_proj(mu_seq[-1])            # previous mu
             # update hidden
             h = self.gru(inp, h)               # (B,d)
             # predict params
@@ -210,7 +223,7 @@ def train(
     d_set = AgentSequenceDataset(drone_data_root=drone_data_root, original_dataset_root=original_dataset_root, classes=classes, T_past=T_past, T_future=T_future)
     train_dataloader = DataLoader(d_set, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=4)
     model = TrajectoryModel(10, 10, d_model = 64).to(device)
-    optimizer = torch.optim.AdamW(model.parameters, lr = lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr = lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs, eta_min = 1e-5)
     model.train()
     for epoch in range(epochs):
@@ -238,7 +251,7 @@ def train(
 if __name__ == "__main__":
     train(
         drone_data_root="square_stanford_data",
-        original_dataset_root="stanford_campus_dataset",
+        original_dataset_root="stanford_data/archive",
         classes=['Pedestrian','Biker','Skater','Cart','Car','Bus'],
         T_past=10,
         T_future=10,
@@ -246,4 +259,3 @@ if __name__ == "__main__":
         lr=1e-3,
         epochs=20
     )
-
