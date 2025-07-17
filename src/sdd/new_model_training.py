@@ -118,12 +118,12 @@ class TrajectoryModel(nn.Module):
     Transformer encoder + GRU-based autoregressive decoder predicting
     future Gaussian (mu, logvar) per timestep, with mask embedding.
     """
-    def __init__(self, T_past, T_future, labels, d_model=128, nhead=4, num_layers=3):
+    def __init__(self, T_past, T_future, d_model=128, nhead=4, num_layers=3):
         super().__init__()
         self.T_past = T_past
         self.T_future = T_future
         self.d_model = d_model
-        self.labels = labels
+        # self.labels = labels
 
         # input projection for coords
         self.input_proj = nn.Linear(2, d_model)
@@ -132,7 +132,7 @@ class TrajectoryModel(nn.Module):
         self.e_miss = nn.Parameter(torch.randn(d_model))
         # positional embeddings
         self.pos_emb = nn.Parameter(torch.randn(T_past, d_model))
-        self.label_emb = nn.Embedding(num_classes, d_model)
+        # self.label_emb = nn.Embedding(num_classes, d_model)
 
         # transformer encoder
         enc_layer = nn.TransformerEncoderLayer(d_model, nhead, d_model*4, dropout=0.1)
@@ -155,8 +155,8 @@ class TrajectoryModel(nn.Module):
         x = x + self.pos_emb.unsqueeze(0)
 
         # label encoding 
-        lbl = self.label_emb(self.labels.to(x.device)) 
-        x = x + lbl
+        # lbl = self.label_emb(self.labels.to(x.device))
+        # x = x + lbl
 
 
         # encoder
