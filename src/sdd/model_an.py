@@ -1,11 +1,69 @@
 import torch.nn as nn
 import torch
 import os 
-from prototype1 import SpatialEncoding, PositionalEncoding, denormalize_positions
+from training_loop_an import SpatialEncoding, PositionalEncoding, denormalize_positions
+def denormalize_positions(normalized_coords, video_stats):
+    """Convert normalized coordinates back to original scale"""
+    if video_stats is None:
+        return normalized_coords
+    
+    if isinstance(normalized_coords, torch.Tensor):
+        device = normalized_coords.device
+        mean = torch.tensor(video_stats['mean']).to(device)
+        std = torch.tensor(video_stats['std']).to(device)
+        return normalized_coords * std + mean
+    else:
+        return normalized_coords * video_stats['std'] + video_stats['mean']
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len = 1000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, max_len, 2).float() * (-math.log(10000)/d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
 
 
+class SpatialEncoding(nn.Module):
+    def __init__(self, d_model, max_pos=10000):
+        super(SpatialEncoding, self).__init__()
+        self.d_model = d_model
+        self.max_pos = max_pos
+        self.pos_embed = nn.Linear(2, d_model)
+        self.half_dim = d_model//2
 
+        div_term = torch.exp(
+            torch.arange(0, self.half_dim, 2).float() *
+            ( -math.log(10000.0) / self.half_dim )
+        )
+        self.register_buffer('div_term', div_term)
 
+    def forward(self, positions: torch.Tensor) -> torch.Tensor:
+        """
+        positions: (B, T, 2)  — normalized x,y in [0,1]
+        returns:    (B, T, d_model)
+        """
+        B, T, _ = positions.shape
+        scaled = positions * self.max_pos   # now in [0, max_pos]
+
+        pe_x = torch.zeros(B, T, self.half_dim, device=positions.device)
+
+        pe_x[:, :, 0::2] = torch.sin(scaled[:, :, 0:1] * self.div_term)
+        pe_x[:, :, 1::2] = torch.cos(scaled[:, :, 0:1] * self.div_term)
+
+        pe_y = torch.zeros(B, T, self.half_dim, device=positions.device)
+        pe_y[:, :, 0::2] = torch.sin(scaled[:, :, 1:2] * self.div_term)
+        pe_y[:, :, 1::2] = torch.cos(scaled[:, :, 1:2] * self.div_term)
+        
+        # concatenate x and y → (B, T, d_model)
+        return torch.cat([pe_x, pe_y], dim=-1)
+  
 class LandscapeAwareTrajectoryPredictor(nn.Module):
     def __init__(self, num_classes, locations, d_model=256, nhead=8, num_layers=6, 
                  T_past=10, T_future=10, use_deltas=True, predict_uncertainty=True):
@@ -618,106 +676,6 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
         }
 
 
-class TrajectoryLoss(nn.Module):
-    """Loss function for trajectory prediction with uncertainty"""
-    
-    def __init__(self, use_deltas=True, predict_uncertainty=True, 
-                 position_weight=1.0, delta_weight=1.0, uncertainty_weight=0.1):
-        super().__init__()
-        self.use_deltas = use_deltas
-        self.predict_uncertainty = predict_uncertainty
-        self.position_weight = position_weight
-        self.delta_weight = delta_weight
-        self.uncertainty_weight = uncertainty_weight
-        
-    def forward(self, predictions, targets):
-        total_loss = 0.0
-        loss_dict = {}
-        
-        # Mask for valid (non-occluded) future positions
-        valid_mask = targets['occ_mask']  # (batch, T_future)
-        
-        if self.predict_uncertainty:
-            # Negative log likelihood loss for positions
-            if 'future_positions_mu' in predictions:
-                pos_mu = predictions['future_positions_mu']
-                pos_logvar = predictions['future_positions_logvar']
-                pos_target = targets['future_positions']
-                
-                pos_loss = self._gaussian_nll_loss(pos_mu, pos_logvar, pos_target, valid_mask)
-                loss_dict['position_loss'] = pos_loss
-                total_loss += self.position_weight * pos_loss
-            
-            # Negative log likelihood loss for deltas
-            if self.use_deltas and 'future_deltas_mu' in predictions:
-                delta_mu = predictions['future_deltas_mu']
-                delta_logvar = predictions['future_deltas_logvar']
-                delta_target = targets['future_deltas']
-                
-                delta_loss = self._gaussian_nll_loss(delta_mu, delta_logvar, delta_target, valid_mask)
-                loss_dict['delta_loss'] = delta_loss
-                total_loss += self.delta_weight * delta_loss
-            
-            # Uncertainty regularization (prevent overconfident predictions)
-            if 'future_positions_logvar' in predictions:
-                uncertainty_reg = -predictions['future_positions_logvar'].mean()
-                loss_dict['uncertainty_reg'] = uncertainty_reg
-                total_loss += self.uncertainty_weight * uncertainty_reg
-                
-        else:
-            # Standard MSE loss
-            if 'future_positions' in predictions:
-                pos_loss = self._masked_mse_loss(
-                    predictions['future_positions'], targets['future_positions'], valid_mask
-                )
-                loss_dict['position_loss'] = pos_loss
-                total_loss += self.position_weight * pos_loss
-            
-            if self.use_deltas and 'future_deltas' in predictions:
-                delta_loss = self._masked_mse_loss(
-                    predictions['future_deltas'], targets['future_deltas'], valid_mask
-                )
-                loss_dict['delta_loss'] = delta_loss
-                total_loss += self.delta_weight * delta_loss
-        
-        loss_dict['total_loss'] = total_loss
-        return total_loss, loss_dict
-    
-    def _gaussian_nll_loss(self, mu, logvar, target, mask):
-        """Negative log likelihood for Gaussian distribution"""
-        # Expand mask to match tensor dimensions
-        mask_expanded = mask.unsqueeze(-1).expand_as(mu)
-        
-        # Compute NLL only for valid positions
-        var = torch.exp(logvar)
-        nll = 0.5 * (logvar + ((target - mu) ** 2) / var)
-        
-        # Apply mask and average
-        masked_nll = nll * mask_expanded
-        return masked_nll.sum() / mask_expanded.sum()
-    
-    def _masked_mse_loss(self, pred, target, mask):
-        """MSE loss with masking"""
-        mask_expanded = mask.unsqueeze(-1).expand_as(pred)
-        mse = ((pred - target) ** 2) * mask_expanded
-        return mse.sum() / mask_expanded.sum()
-
-
-# Training function example
-def train_step(model, batch, loss_fn, optimizer):
-    """Single training step"""
-    model.train()
-    optimizer.zero_grad()
-    
-    predictions = model(batch)
-    loss, loss_dict = loss_fn(predictions, batch)
-    
-    loss.backward()
-    optimizer.step()
-    
-    return loss.item(), loss_dict
-
-
 # Evaluation metrics
 def compute_metrics(predictions, targets, video_stats=None):
     """Compute evaluation metrics"""
@@ -780,4 +738,11 @@ Issues:
 5. **do you need the unobserved token since during inference that isn't used at all. You'll have incomplete sequences.
 and you'll want to continue it from there. **
 6. Is the estimate_current_position considering when there's no unobserved location. 
+"""
+
+"""
+For the graph model, 
+1. The location embedding should be added after the message passing 
+2. The spatial encoding too should be added after 
+3. 
 """

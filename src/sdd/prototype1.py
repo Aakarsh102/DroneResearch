@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset
 import os 
+import pickle as pkl
 
 
 class PositionalEncoding(nn.Module):
@@ -70,121 +71,126 @@ class AgentSequenceDataset(Dataset):
         self.use_deltas = use_deltas
         self.normalize_positions = normalize_positions
         self.samples = []
+        file = "datastore.pkl"
         
         # For video-wise normalization - compute per-video statistics
         self.video_stats = self._compute_video_stats() if normalize_positions else None
+        if os.path.exists(file):
+            self.samples = pkl.load(open(file, 'rb'))
+        else:
+            # Precompute obs sets per (loc,vid): which (trackId,frame) were seen
+            obs = {}  # obs[(loc,vid)] = set of (trackId,frame)
+            for loc in os.listdir(drone_data_root):
+                loc_path = os.path.join(drone_data_root, loc)
+                if not os.path.isdir(loc_path): continue
+                if loc == 'hyang': continue
+                for dr in os.listdir(loc_path):
+                    dr_path = os.path.join(loc_path, dr)
+                    if not os.path.isdir(dr_path): continue
+                    for fname in os.listdir(dr_path):
+                        if not fname.endswith("_annotations.txt"): continue
+                        vid = fname.replace("_annotations.txt","")
+                        key = (loc, vid)
+                        obs.setdefault(key, set())
+                        df = pd.read_csv(os.path.join(dr_path,fname), sep=' ', header=None,
+                                        names=['trackId','xmin','ymin','xmax','ymax',
+                                                'frame','lost','occluded','generated','label'])
+                        for tid,fr in zip(df['trackId'], df['frame']):
+                            obs[key].add((tid, int(fr)))
 
-        # Precompute obs sets per (loc,vid): which (trackId,frame) were seen
-        obs = {}  # obs[(loc,vid)] = set of (trackId,frame)
-        for loc in os.listdir(drone_data_root):
-            loc_path = os.path.join(drone_data_root, loc)
-            if not os.path.isdir(loc_path): continue
-            if loc == 'hyang': continue
-            for dr in os.listdir(loc_path):
-                dr_path = os.path.join(loc_path, dr)
-                if not os.path.isdir(dr_path): continue
-                for fname in os.listdir(dr_path):
-                    if not fname.endswith("_annotations.txt"): continue
-                    vid = fname.replace("_annotations.txt","")
-                    key = (loc, vid)
-                    obs.setdefault(key, set())
-                    df = pd.read_csv(os.path.join(dr_path,fname), sep=' ', header=None,
-                                     names=['trackId','xmin','ymin','xmax','ymax',
+            # Build samples using original dataset for full tracks
+            for loc in os.listdir(original_dataset_root + "/annotations"):
+                if loc == 'hyang' or loc == ".DS_Store": continue
+                loc_path = os.path.join(original_dataset_root, "annotations", loc)
+                if not os.path.isdir(loc_path):
+                    continue
+                for vid in os.listdir(loc_path):
+                    # load original annotations
+                    orig_file = os.path.join(original_dataset_root,"annotations",loc,vid,"annotations.txt")
+                    if not os.path.isfile(orig_file): continue
+                    odf = pd.read_csv(orig_file, sep=' ', header=None,
+                                    names=['trackId','xmin','ymin','xmax','ymax',
                                             'frame','lost','occluded','generated','label'])
-                    for tid,fr in zip(df['trackId'], df['frame']):
-                        obs[key].add((tid, int(fr)))
+                    # compute centers
+                    odf['x'] = (odf.xmin + odf.xmax)/2
+                    odf['y'] = (odf.ymin + odf.ymax)/2
+                    # keep only labels in classes
+                    odf = odf[odf['label'].isin(self.classes)]
+                    # group by track
+                    key = (loc, vid)
+                    seen = obs.get(key, set())
+                    video_key = f"{loc}_{vid}"
+                    
+                    for tid, grp in odf.groupby('trackId'):
+                        grp = grp.sort_values('frame')
+                        frames = grp['frame'].values
+                        coords = np.stack([grp['x'].values, grp['y'].values], axis=1)
+                        occs   = (grp['occluded']==0).astype(np.float32).values
+                        # build observation mask
+                        obs_mask = np.array([1.0 if (tid, int(f)) in seen else 0.0 for f in frames],
+                                            dtype=np.float32)
+                        L = len(frames)
+                        window = self.T_past + self.T_future
+                        for i in range(L - window + 1):
+                            # ensure continuous frames in original
+                            if frames[i+self.T_past-1] - frames[i] != self.T_past-1:
+                                continue
+                            if frames[i+window-1]   - frames[i+self.T_past] != self.T_future-1:
+                                continue
+                            # require at least one observed in past
+                            if obs_mask[i:i+self.T_past].sum() < 1:
+                                continue
+                            
+                            past_coords = coords[i:i+self.T_past]
+                            future_coords = coords[i+self.T_past:i+window]
+                            past_obs = obs_mask[i:i+self.T_past]
+                            future_occ = occs[i+self.T_past:i+window]
+                            label = grp['label'].values[i+self.T_past-1]
+                            idx = self.cls2idx[label]
+                            
+                            # Store original coordinates for spatial encoding
+                            orig_past_coords = past_coords.copy()
+                            orig_future_coords = future_coords.copy()
+                            
+                            # Normalize positions if requested (video-wise normalization)
+                            if self.normalize_positions:
+                                past_coords = self._normalize_coords(past_coords, video_key)
+                                future_coords = self._normalize_coords(future_coords, video_key)
+                            
+                            # Create sample dictionary
+                            sample = {
+                                'past_positions': past_coords.astype(np.float32),
+                                'future_positions': future_coords.astype(np.float32),
+                                'past_positions_orig': orig_past_coords.astype(np.float32),  # For spatial encoding
+                                'future_positions_orig': orig_future_coords.astype(np.float32),  # For spatial encoding
+                                'obs_mask': past_obs,
+                                'occ_mask': future_occ.astype(np.float32),
+                                'label': idx,
+                                'location': loc,
+                                'video': vid,
+                                'track_id': tid,
+                                'start_frame': frames[i]
+                            }
+                            
+                            # Add delta features if requested
+                            if self.use_deltas:
+                                # Past deltas (movement between consecutive frames)
+                                past_deltas = np.diff(past_coords, axis=0)  # (T_past-1, 2)
+                                # Pad with zeros for first frame (no previous delta)
+                                past_deltas = np.concatenate([np.zeros((1, 2)), past_deltas], axis=0)
+                                
+                                # Future deltas
+                                future_deltas = np.diff(future_coords, axis=0)  # (T_future-1, 2)
+                                # Add the delta from last past to first future
+                                transition_delta = future_coords[0] - past_coords[-1]
+                                future_deltas = np.concatenate([transition_delta.reshape(1, 2), future_deltas], axis=0)
+                                
+                                sample['past_deltas'] = past_deltas.astype(np.float32)
+                                sample['future_deltas'] = future_deltas.astype(np.float32)
+                            
+                            self.samples.append(sample)
 
-        # Build samples using original dataset for full tracks
-        for loc in os.listdir(original_dataset_root + "/annotations"):
-            if loc == 'hyang' or loc == ".DS_Store": continue
-            loc_path = os.path.join(original_dataset_root, "annotations", loc)
-            if not os.path.isdir(loc_path):
-                continue
-            for vid in os.listdir(loc_path):
-                # load original annotations
-                orig_file = os.path.join(original_dataset_root,"annotations",loc,vid,"annotations.txt")
-                if not os.path.isfile(orig_file): continue
-                odf = pd.read_csv(orig_file, sep=' ', header=None,
-                                  names=['trackId','xmin','ymin','xmax','ymax',
-                                         'frame','lost','occluded','generated','label'])
-                # compute centers
-                odf['x'] = (odf.xmin + odf.xmax)/2
-                odf['y'] = (odf.ymin + odf.ymax)/2
-                # keep only labels in classes
-                odf = odf[odf['label'].isin(self.classes)]
-                # group by track
-                key = (loc, vid)
-                seen = obs.get(key, set())
-                video_key = f"{loc}_{vid}"
-                
-                for tid, grp in odf.groupby('trackId'):
-                    grp = grp.sort_values('frame')
-                    frames = grp['frame'].values
-                    coords = np.stack([grp['x'].values, grp['y'].values], axis=1)
-                    occs   = (grp['occluded']==0).astype(np.float32).values
-                    # build observation mask
-                    obs_mask = np.array([1.0 if (tid, int(f)) in seen else 0.0 for f in frames],
-                                        dtype=np.float32)
-                    L = len(frames)
-                    window = self.T_past + self.T_future
-                    for i in range(L - window + 1):
-                        # ensure continuous frames in original
-                        if frames[i+self.T_past-1] - frames[i] != self.T_past-1:
-                            continue
-                        if frames[i+window-1]   - frames[i+self.T_past] != self.T_future-1:
-                            continue
-                        # require at least one observed in past
-                        if obs_mask[i:i+self.T_past].sum() < 1:
-                            continue
-                        
-                        past_coords = coords[i:i+self.T_past]
-                        future_coords = coords[i+self.T_past:i+window]
-                        past_obs = obs_mask[i:i+self.T_past]
-                        future_occ = occs[i+self.T_past:i+window]
-                        label = grp['label'].values[i+self.T_past-1]
-                        idx = self.cls2idx[label]
-                        
-                        # Store original coordinates for spatial encoding
-                        orig_past_coords = past_coords.copy()
-                        orig_future_coords = future_coords.copy()
-                        
-                        # Normalize positions if requested (video-wise normalization)
-                        if self.normalize_positions:
-                            past_coords = self._normalize_coords(past_coords, video_key)
-                            future_coords = self._normalize_coords(future_coords, video_key)
-                        
-                        # Create sample dictionary
-                        sample = {
-                            'past_positions': past_coords.astype(np.float32),
-                            'future_positions': future_coords.astype(np.float32),
-                            'past_positions_orig': orig_past_coords.astype(np.float32),  # For spatial encoding
-                            'future_positions_orig': orig_future_coords.astype(np.float32),  # For spatial encoding
-                            'obs_mask': past_obs,
-                            'occ_mask': future_occ.astype(np.float32),
-                            'label': idx,
-                            'location': loc,
-                            'video': vid,
-                            'track_id': tid,
-                            'start_frame': frames[i]
-                        }
-                        
-                        # Add delta features if requested
-                        if self.use_deltas:
-                            # Past deltas (movement between consecutive frames)
-                            past_deltas = np.diff(past_coords, axis=0)  # (T_past-1, 2)
-                            # Pad with zeros for first frame (no previous delta)
-                            past_deltas = np.concatenate([np.zeros((1, 2)), past_deltas], axis=0)
-                            
-                            # Future deltas
-                            future_deltas = np.diff(future_coords, axis=0)  # (T_future-1, 2)
-                            # Add the delta from last past to first future
-                            transition_delta = future_coords[0] - past_coords[-1]
-                            future_deltas = np.concatenate([transition_delta.reshape(1, 2), future_deltas], axis=0)
-                            
-                            sample['past_deltas'] = past_deltas.astype(np.float32)
-                            sample['future_deltas'] = future_deltas.astype(np.float32)
-                        
-                        self.samples.append(sample)
+                    pkl.dump(self.samples, open(file, "wb"))
 
     def _compute_video_stats(self):
         """Compute per-video position statistics for normalization"""

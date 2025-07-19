@@ -15,7 +15,18 @@ from collections import defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-
+def denormalize_positions(normalized_coords, video_stats):
+    """Convert normalized coordinates back to original scale"""
+    if video_stats is None:
+        return normalized_coords
+    
+    if isinstance(normalized_coords, torch.Tensor):
+        device = normalized_coords.device
+        mean = torch.tensor(video_stats['mean']).to(device)
+        std = torch.tensor(video_stats['std']).to(device)
+        return normalized_coords * std + mean
+    else:
+        return normalized_coords * video_stats['std'] + video_stats['mean']
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len = 1000):
