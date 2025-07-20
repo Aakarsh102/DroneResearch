@@ -1,7 +1,6 @@
 import torch.nn as nn
 import torch
 import os 
-from training_loop_an import SpatialEncoding, PositionalEncoding, denormalize_positions
 def denormalize_positions(normalized_coords, video_stats):
     """Convert normalized coordinates back to original scale"""
     if video_stats is None:
@@ -20,7 +19,7 @@ class PositionalEncoding(nn.Module):
         super(PositionalEncoding, self).__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, max_len, 2).float() * (-math.log(10000)/d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000)/d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
@@ -157,7 +156,7 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
         for i in range(self.T_future):
             temporal_pos = self.T_past + i
             if temporal_pos < self.temporal_encoding.pe.size(0):
-                temporal_emb = self.temporal_encoding.pe[temporal_pos].unsqueeze(0)  # (1, d_model)
+                temporal_emb = self.temporal_encoding.pe[temporal_pos]  # (1, d_model)
                 decoder_input[:, i, :] += temporal_emb
         
         # Create causal mask for autoregressive property
@@ -183,11 +182,13 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
                 positions = self._convert_deltas_to_positions_teacher_forcing(
                     current_pos_est, delta_mu
                 )
+                future_positions_logvar = self._propagate_uncertainty(delta_logvar)
                 
                 return {
                     'future_deltas_mu': delta_mu,
                     'future_deltas_logvar': delta_logvar,
-                    'future_positions_mu': positions
+                    'future_positions_mu': positions,
+                    'future_positions_logvar': future_positions_logvar 
                 }
             else:
                 delta_pred = delta_predictions
