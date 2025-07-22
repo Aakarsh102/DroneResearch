@@ -1404,7 +1404,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from model_an import LandscapeAwareTrajectoryPredictor, compute_metrics
+from sdd.prototype1.model_an import LandscapeAwareTrajectoryPredictor, compute_metrics
 import math
 import os
 import pickle as pkl
@@ -2127,6 +2127,7 @@ t_future = 10
 #AgentSequenceDataset("/Users/aakarshrai/Desktop/square_stanford_data", "/Users/aakarshrai/Desktop/stanford_data/archive", 
 #                     ['Pedestrian','Biker','Skater','Cart','Car','Bus'], T_past = 10, T_future=20, use_deltas=True, normalize_positions=False)
 
+
 def setup_device():
     """Setup device for training"""
     if torch.cuda.is_available():
@@ -2138,11 +2139,14 @@ def setup_device():
         print("Using CPU")
     return device
 
-def create_data_loaders(drone_data_root, original_dataroot, classes, T_past = 10, T_future = 10, use_deltas = True,
-                        normalize_positions=True,
-                       batch_size=32, train_split=0.9, val_split=0.1, num_workers=4):
-    print('loding dataset')
-    dataset = OptimizedAgentSequenceDataset(drone_data_root, original_dataroot, classes, T_past, T_future, use_deltas, normalize_positions)
+def create_data_loaders(drone_data_root, original_dataroot, classes, T_past=10, T_future=10, 
+                        use_deltas=True, normalize_positions=True, batch_size=32, 
+                        train_split=0.9, val_split=0.1, num_workers=4):
+    print('Loading dataset')
+    dataset = OptimizedAgentSequenceDataset(
+        drone_data_root, original_dataroot, classes, T_past, T_future, 
+        use_deltas, normalize_positions
+    )
     total_size = len(dataset)
     train_size = int(train_split * total_size)
     val_size = total_size - train_size
@@ -2151,6 +2155,7 @@ def create_data_loaders(drone_data_root, original_dataroot, classes, T_past = 10
         dataset, [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
+    
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, 
         num_workers=num_workers, pin_memory=True
@@ -2161,9 +2166,11 @@ def create_data_loaders(drone_data_root, original_dataroot, classes, T_past = 10
     )
     return train_loader, val_loader, dataset
 
-
-def initialize_model(num_classes, locations, device):
-    model = LandscapeAwareTrajectoryPredictor(num_classes, locations, d_model=64, num_layers=2, T_past = t_past, T_future=t_future)
+def initialize_model(num_classes, locations, device, d_model=64, num_layers=2, T_past=10, T_future=10):
+    model = LandscapeAwareTrajectoryPredictor(
+        num_classes, locations, d_model=d_model, num_layers=num_layers, 
+        T_past=T_past, T_future=T_future
+    )
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -2201,40 +2208,49 @@ def create_optimizer_scheduler(model, learning_rate=1e-4, weight_decay=1e-5,
     
     return optimizer, scheduler
 
-def train_epoch(model, train_loader, optimizer, loss_fn, device, use_teacher_forcing = True):
+def train_epoch(model, train_loader, optimizer, loss_fn, device, use_teacher_forcing=True):
     model.train()
     epoch_losses = defaultdict(list) 
     pbar = tqdm(train_loader, desc="Training")
+    
     for batch_idx, batch in enumerate(pbar):
+        # Move batch to device
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
                 for k, v in batch.items()}
         
         optimizer.zero_grad()
 
-        predictions = model(batch, use_teacher_forcing=use_teacher_forcing)
+        try:
+            predictions = model(batch, use_teacher_forcing=use_teacher_forcing)
+            loss, loss_dict = loss_fn(predictions, batch)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
 
-        loss, loss_dict = loss_fn(predictions, batch)
-        
-        # Backward pass
-        loss.backward()
+            # Record losses
+            for key, value in loss_dict.items():
+                if isinstance(value, torch.Tensor):
+                    epoch_losses[key].append(value.item())
+                else:
+                    epoch_losses[key].append(value)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-
-        for key, value in loss_dict.items():
-            if isinstance(value, torch.Tensor):
-                epoch_losses[key].append(value.item())
-            else:
-                epoch_losses[key].append(value)
-
-        pbar.set_postfix({
-            'Loss': f"{loss.item():.4f}",
-            'LR': f"{optimizer.param_groups[0]['lr']:.2e}"
-        })
+            pbar.set_postfix({
+                'Loss': f"{loss.item():.4f}",
+                'LR': f"{optimizer.param_groups[0]['lr']:.2e}"
+            })
+            
+        except Exception as e:
+            print(f"Error in training batch {batch_idx}: {e}")
+            # Skip this batch and continue
+            continue
+    
     avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
     return avg_losses
-
 
 def validate_epoch(model, val_loader, loss_fn, device, dataset=None):
     """Validate for one epoch"""
@@ -2244,53 +2260,64 @@ def validate_epoch(model, val_loader, loss_fn, device, dataset=None):
     
     with torch.inference_mode():
         pbar = tqdm(val_loader, desc="Validation")
-        for batch in pbar:
-            # Move batch to device
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                    for k, v in batch.items()}
-            
-            # Forward pass (no teacher forcing for validation)
-            predictions = model(batch, use_teacher_forcing=False)
-            
-            # Compute loss
-            loss, loss_dict = loss_fn(predictions, batch)
-            
-            # Record losses
-            for key, value in loss_dict.items():
-                if isinstance(value, torch.Tensor):
-                    epoch_losses[key].append(value.item())
-                else:
-                    epoch_losses[key].append(value)
-            
-            # Compute metrics for each sample in batch
-            for i in range(len(batch['location'])):
-                # Extract single sample
-                single_pred = {}
-                single_target = {}
+        for batch_idx, batch in enumerate(pbar):
+            try:
+                # Move batch to device
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
                 
-                for key, value in predictions.items():
+                # Forward pass (no teacher forcing for validation)
+                predictions = model(batch, use_teacher_forcing=False)
+                
+                # Compute loss
+                loss, loss_dict = loss_fn(predictions, batch)
+                
+                # Record losses
+                for key, value in loss_dict.items():
                     if isinstance(value, torch.Tensor):
-                        single_pred[key] = value[i:i+1]
+                        epoch_losses[key].append(value.item())
+                    else:
+                        epoch_losses[key].append(value)
                 
-                for key in ['future_positions', 'occ_mask', 'location', 'video']:
-                    if key in batch:
-                        if isinstance(batch[key], torch.Tensor):
-                            single_target[key] = batch[key][i:i+1]
-                        elif isinstance(batch[key], list):
-                            single_target[key] = [batch[key][i]]
-                        else:
-                            single_target[key] = batch[key][i]
+                # Compute metrics for each sample in batch
+                batch_size = len(batch.get('location', batch.get('future_positions', [None])))
+                for i in range(batch_size):
+                    # Extract single sample
+                    single_pred = {}
+                    single_target = {}
+                    
+                    for key, value in predictions.items():
+                        if isinstance(value, torch.Tensor):
+                            single_pred[key] = value[i:i+1]
+                    
+                    for key in ['future_positions', 'occ_mask', 'location', 'video']:
+                        if key in batch:
+                            if isinstance(batch[key], torch.Tensor):
+                                single_target[key] = batch[key][i:i+1]
+                            elif isinstance(batch[key], list):
+                                single_target[key] = [batch[key][i]]
+                            else:
+                                single_target[key] = batch[key] if not hasattr(batch[key], '__getitem__') else batch[key][i]
+                    
+                    # Get video stats for denormalization if available
+                    video_key = None
+                    if 'location' in single_target and 'video' in single_target:
+                        if isinstance(single_target['location'], list) and isinstance(single_target['video'], list):
+                            video_key = f"{single_target['location'][0]}_{single_target['video'][0]}"
+                    
+                    video_stats = dataset.get_video_stats(video_key) if dataset and video_key else None
+                    
+                    # Compute metrics
+                    metrics = compute_metrics(single_pred, single_target, video_stats)
+                    for k, v in metrics.items():
+                        all_metrics[k].append(v)
                 
-                # Get video stats for denormalization if available
-                video_key = f"{single_target['location'][0]}_{single_target['video'][0]}"
-                video_stats = dataset.get_video_stats(video_key) if dataset else None
+                pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
                 
-                # Compute metrics
-                metrics = compute_metrics(single_pred, single_target, video_stats)
-                for k, v in metrics.items():
-                    all_metrics[k].append(v)
-            
-            pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
+            except Exception as e:
+                print(f"Error in validation batch {batch_idx}: {e}")
+                # Skip this batch and continue
+                continue
     
     # Average losses and metrics
     avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
@@ -2329,10 +2356,15 @@ def plot_training_curves(train_losses_history, val_losses_history, val_metrics_h
     """Plot and save training curves"""
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
+    # Get the first available loss key as the main loss
+    main_loss_key = next(iter(train_losses_history.keys())) if train_losses_history else 'loss'
+    
     # Loss curves
-    axes[0, 0].plot(train_losses_history['total_loss'], label='Train')
-    axes[0, 0].plot(val_losses_history['total_loss'], label='Validation')
-    axes[0, 0].set_title('Total Loss')
+    if main_loss_key in train_losses_history:
+        axes[0, 0].plot(train_losses_history[main_loss_key], label='Train')
+    if main_loss_key in val_losses_history:
+        axes[0, 0].plot(val_losses_history[main_loss_key], label='Validation')
+    axes[0, 0].set_title(f'{main_loss_key} Loss')
     axes[0, 0].set_xlabel('Epoch')
     axes[0, 0].set_ylabel('Loss')
     axes[0, 0].legend()
@@ -2366,14 +2398,13 @@ def plot_training_curves(train_losses_history, val_losses_history, val_metrics_h
     plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
-
 def main():
     """Main training function"""
     # Configuration
     config = {
         'drone_data_root': "../../square_stanford_data",
         'original_dataset_root': "../../stanford_data/archive",
-        'classes': ['Pedestrian','Biker','Skater','Cart','Car','Bus'],  # UPDATE WITH YOUR CLASSES
+        'classes': ['Pedestrian','Biker','Skater','Cart','Car','Bus'],
         
         # Model parameters
         'model_params': {
@@ -2381,7 +2412,7 @@ def main():
             'nhead': 8,
             'num_layers': 1,
             'T_past': 10,
-            'T_future': 10,
+            'T_future': 20,
             'use_deltas': True,
             'predict_uncertainty': True
         },
@@ -2423,7 +2454,7 @@ def main():
         json.dump(config, f, indent=2)
     
     # Create data loaders
-    train_loader, val_loader, dataset= create_data_loaders(
+    train_loader, val_loader, dataset = create_data_loaders(
         drone_data_root=config['drone_data_root'],
         original_dataroot=config['original_dataset_root'],
         classes=config['classes'],
@@ -2437,25 +2468,27 @@ def main():
         num_workers=config['num_workers']
     )
     
-    # Get locations for model initialization
-    # locations = list(set([sample.location for sample in dataset.dataset.samples]))
-    #locations = ['Pedestrian','Biker','Skater','Cart','Car','Bus']
+    # Define locations for model initialization
     locations = [
-    "bookstore",
-    "coupa",
-    "deathCircle",
-    "gates",
-    "hyang",
-    "little",
-    "nexus",
-    "quad",
-]
+        "bookstore",
+        "coupa",
+        "deathCircle",
+        "gates",
+        "hyang",
+        "little",
+        "nexus",
+        "quad",
+    ]
     
     # Initialize model
     model = initialize_model(
         num_classes=len(config['classes']),
         locations=locations,
-        device=device
+        device=device,
+        d_model=config['model_params']['d_model'],
+        num_layers=config['model_params']['num_layers'],
+        T_past=config['model_params']['T_past'],
+        T_future=config['model_params']['T_future']
     )
     
     # Create loss function
@@ -2510,8 +2543,10 @@ def main():
         
         # Update learning rate
         if scheduler is not None:
+            # Get the main loss for scheduling
+            main_loss_key = next(iter(val_losses.keys())) if val_losses else 'loss'
             if config['scheduler_type'] == 'plateau':
-                scheduler.step(val_losses['total_loss'])
+                scheduler.step(val_losses.get(main_loss_key, 0.0))
             else:
                 scheduler.step()
         
@@ -2527,18 +2562,23 @@ def main():
         
         # Print epoch results
         epoch_time = time.time() - start_time
+        main_loss_key = next(iter(train_losses.keys())) if train_losses else 'loss'
+        
         print(f"Epoch {epoch + 1} completed in {epoch_time:.1f}s")
-        print(f"Train Loss: {train_losses['total_loss']:.4f}")
-        print(f"Val Loss: {val_losses['total_loss']:.4f}")
+        if main_loss_key in train_losses:
+            print(f"Train Loss ({main_loss_key}): {train_losses[main_loss_key]:.4f}")
+        if main_loss_key in val_losses:
+            print(f"Val Loss ({main_loss_key}): {val_losses[main_loss_key]:.4f}")
         if 'ADE' in val_metrics:
             print(f"Val ADE: {val_metrics['ADE']:.4f}")
         if 'FDE' in val_metrics:
             print(f"Val FDE: {val_metrics['FDE']:.4f}")
         
         # Save checkpoint
-        is_best = val_losses['total_loss'] < best_val_loss
+        current_val_loss = val_losses.get(main_loss_key, float('inf'))
+        is_best = current_val_loss < best_val_loss
         if is_best:
-            best_val_loss = val_losses['total_loss']
+            best_val_loss = current_val_loss
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -2556,12 +2596,12 @@ def main():
                 is_best=is_best
             )
         
-        # # Plot training curves
-        # if (epoch + 1) % 5 == 0:  # Plot every 5 epochs
-        #     plot_training_curves(
-        #         train_losses_history, val_losses_history, 
-        #         val_metrics_history, config['save_dir']
-        #     )
+        # Plot training curves every 5 epochs
+       # if (epoch + 1) % 5 == 0:
+        #    plot_training_curves(
+         #       train_losses_history, val_losses_history, 
+          #      val_metrics_history, config['save_dir']
+           # )
         
         # Early stopping
         if epochs_without_improvement >= config['early_stopping_patience']:
@@ -2571,25 +2611,9 @@ def main():
     print("\nTraining completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
     
-    # Final evaluation on test set
-    print("\nEvaluating on test set...")
-    test_losses, test_metrics = validate_epoch(
-        model=model,
-        val_loader=test_loader,
-        loss_fn=loss_fn,
-        device=device,
-        dataset=dataset
-    )
-    
-    print("Test Results:")
-    for key, value in test_metrics.items():
-        print(f"  {key}: {value:.4f}")
-    
     # Save final results
     final_results = {
         'best_val_loss': best_val_loss,
-        'test_losses': test_losses,
-        'test_metrics': test_metrics,
         'training_history': {
             'train_losses': train_losses_history,
             'val_losses': val_losses_history,
@@ -2615,3 +2639,508 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+
+
+
+
+
+
+# def setup_device():
+#     """Setup device for training"""
+#     if torch.cuda.is_available():
+#         device = torch.device('cuda')
+#         print(f"Using GPU: {torch.cuda.get_device_name()}")
+#         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+#     else:
+#         device = torch.device('cpu')
+#         print("Using CPU")
+#     return device
+
+# def create_data_loaders(drone_data_root, original_dataroot, classes, T_past=10, T_future=10, 
+#                         use_deltas=True, normalize_positions=True, batch_size=32, 
+#                         train_split=0.9, val_split=0.1, num_workers=4):
+#     print('Loading dataset')
+#     dataset = OptimizedAgentSequenceDataset(
+#         drone_data_root, original_dataroot, classes, T_past, T_future, 
+#         use_deltas, normalize_positions
+#     )
+#     total_size = len(dataset)
+#     train_size = int(train_split * total_size)
+#     val_size = total_size - train_size
+
+#     train_dataset, val_dataset = torch.utils.data.random_split(
+#         dataset, [train_size, val_size],
+#         generator=torch.Generator().manual_seed(42)
+#     )
+    
+#     train_loader = DataLoader(
+#         train_dataset, batch_size=batch_size, shuffle=True, 
+#         num_workers=num_workers, pin_memory=True
+#     )
+#     val_loader = DataLoader(
+#         val_dataset, batch_size=batch_size, shuffle=False, 
+#         num_workers=num_workers, pin_memory=True
+#     )
+#     return train_loader, val_loader, dataset
+
+# def initialize_model(num_classes, locations, device, d_model=64, num_layers=2, T_past=10, T_future=10):
+#     model = LandscapeAwareTrajectoryPredictor(
+#         num_classes, locations, d_model=d_model, num_layers=num_layers, 
+#         T_past=T_past, T_future=T_future
+#     )
+#     model = model.to(device)
+
+#     total_params = sum(p.numel() for p in model.parameters())
+#     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+#     print(f"Model initialized:")
+#     print(f"  Total parameters: {total_params:,}")
+#     print(f"  Trainable parameters: {trainable_params:,}")
+    
+#     return model
+
+# def create_optimizer_scheduler(model, learning_rate=1e-4, weight_decay=1e-5, 
+#                              scheduler_type='cosine', num_epochs=100):
+#     """Create optimizer and learning rate scheduler"""
+#     optimizer = torch.optim.AdamW(
+#         model.parameters(), 
+#         lr=learning_rate, 
+#         weight_decay=weight_decay
+#     )
+    
+#     if scheduler_type == 'cosine':
+#         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+#             optimizer, T_max=num_epochs, eta_min=1e-6
+#         )
+#     elif scheduler_type == 'step':
+#         scheduler = torch.optim.lr_scheduler.StepLR(
+#             optimizer, step_size=30, gamma=0.5
+#         )
+#     elif scheduler_type == 'plateau':
+#         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+#             optimizer, mode='min', factor=0.5, patience=10, verbose=True
+#         )
+#     else:
+#         scheduler = None
+    
+#     return optimizer, scheduler
+
+# def train_epoch(model, train_loader, optimizer, loss_fn, device, use_teacher_forcing=True):
+#     model.train()
+#     epoch_losses = defaultdict(list) 
+#     pbar = tqdm(train_loader, desc="Training")
+    
+#     for batch_idx, batch in enumerate(pbar):
+#         # Move batch to device
+#         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+#                 for k, v in batch.items()}
+        
+#         optimizer.zero_grad()
+
+#         try:
+#             predictions = model(batch, use_teacher_forcing=use_teacher_forcing)
+#             loss, loss_dict = loss_fn(predictions, batch)
+            
+#             # Backward pass
+#             loss.backward()
+            
+#             # Gradient clipping
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+#             optimizer.step()
+
+#             # Record losses
+#             for key, value in loss_dict.items():
+#                 if isinstance(value, torch.Tensor):
+#                     epoch_losses[key].append(value.item())
+#                 else:
+#                     epoch_losses[key].append(value)
+
+#             pbar.set_postfix({
+#                 'Loss': f"{loss.item():.4f}",
+#                 'LR': f"{optimizer.param_groups[0]['lr']:.2e}"
+#             })
+            
+#         except Exception as e:
+#             print(f"Error in training batch {batch_idx}: {e}")
+#             # Skip this batch and continue
+#             continue
+    
+#     avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
+#     return avg_losses
+
+# def validate_epoch(model, val_loader, loss_fn, device, dataset=None):
+#     """Validate for one epoch"""
+#     model.eval()
+#     epoch_losses = defaultdict(list)
+#     all_metrics = defaultdict(list)
+    
+#     with torch.inference_mode():
+#         pbar = tqdm(val_loader, desc="Validation")
+#         for batch_idx, batch in enumerate(pbar):
+#             try:
+#                 # Move batch to device
+#                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+#                         for k, v in batch.items()}
+                
+#                 # Forward pass (no teacher forcing for validation)
+#                 predictions = model(batch, use_teacher_forcing=False)
+                
+#                 # Compute loss
+#                 loss, loss_dict = loss_fn(predictions, batch)
+                
+#                 # Record losses
+#                 for key, value in loss_dict.items():
+#                     if isinstance(value, torch.Tensor):
+#                         epoch_losses[key].append(value.item())
+#                     else:
+#                         epoch_losses[key].append(value)
+                
+#                 # Compute metrics for each sample in batch
+#                 batch_size = len(batch.get('location', batch.get('future_positions', [None])))
+#                 for i in range(batch_size):
+#                     # Extract single sample
+#                     single_pred = {}
+#                     single_target = {}
+                    
+#                     for key, value in predictions.items():
+#                         if isinstance(value, torch.Tensor):
+#                             single_pred[key] = value[i:i+1]
+                    
+#                     for key in ['future_positions', 'occ_mask', 'location', 'video']:
+#                         if key in batch:
+#                             if isinstance(batch[key], torch.Tensor):
+#                                 single_target[key] = batch[key][i:i+1]
+#                             elif isinstance(batch[key], list):
+#                                 single_target[key] = [batch[key][i]]
+#                             else:
+#                                 single_target[key] = batch[key] if not hasattr(batch[key], '__getitem__') else batch[key][i]
+                    
+#                     # Get video stats for denormalization if available
+#                     video_key = None
+#                     if 'location' in single_target and 'video' in single_target:
+#                         if isinstance(single_target['location'], list) and isinstance(single_target['video'], list):
+#                             video_key = f"{single_target['location'][0]}_{single_target['video'][0]}"
+                    
+#                     video_stats = dataset.get_video_stats(video_key) if dataset and video_key else None
+                    
+#                     # Compute metrics
+#                     metrics = compute_metrics(single_pred, single_target, video_stats)
+#                     for k, v in metrics.items():
+#                         all_metrics[k].append(v)
+                
+#                 pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
+                
+#             except Exception as e:
+#                 print(f"Error in validation batch {batch_idx}: {e}")
+#                 # Skip this batch and continue
+#                 continue
+    
+#     # Average losses and metrics
+#     avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
+#     avg_metrics = {k: np.mean(v) for k, v in all_metrics.items()}
+    
+#     return avg_losses, avg_metrics
+
+# def save_checkpoint(model, optimizer, scheduler, epoch, train_losses, val_losses, 
+#                    val_metrics, save_dir, is_best=False):
+#     """Save model checkpoint"""
+#     checkpoint = {
+#         'epoch': epoch,
+#         'model_state_dict': model.state_dict(),
+#         'optimizer_state_dict': optimizer.state_dict(),
+#         'train_losses': train_losses,
+#         'val_losses': val_losses,
+#         'val_metrics': val_metrics
+#     }
+    
+#     if scheduler is not None:
+#         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+    
+#     # Save regular checkpoint
+#     checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch:03d}.pth')
+#     torch.save(checkpoint, checkpoint_path)
+    
+#     # Save best model
+#     if is_best:
+#         best_path = os.path.join(save_dir, 'best_model.pth')
+#         torch.save(checkpoint, best_path)
+#         print(f"New best model saved at epoch {epoch}")
+    
+#     return checkpoint_path
+
+# def plot_training_curves(train_losses_history, val_losses_history, val_metrics_history, save_dir):
+#     """Plot and save training curves"""
+#     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+#     # Loss curves
+#     axes[0, 0].plot(train_losses_history['total_loss'], label='Train')
+#     axes[0, 0].plot(val_losses_history['total_loss'], label='Validation')
+#     axes[0, 0].set_title('Total Loss')
+#     axes[0, 0].set_xlabel('Epoch')
+#     axes[0, 0].set_ylabel('Loss')
+#     axes[0, 0].legend()
+#     axes[0, 0].grid(True)
+    
+#     # ADE metric
+#     if 'ADE' in val_metrics_history:
+#         axes[0, 1].plot(val_metrics_history['ADE'])
+#         axes[0, 1].set_title('Average Displacement Error (ADE)')
+#         axes[0, 1].set_xlabel('Epoch')
+#         axes[0, 1].set_ylabel('ADE')
+#         axes[0, 1].grid(True)
+    
+#     # FDE metric
+#     if 'FDE' in val_metrics_history:
+#         axes[1, 0].plot(val_metrics_history['FDE'])
+#         axes[1, 0].set_title('Final Displacement Error (FDE)')
+#         axes[1, 0].set_xlabel('Epoch')
+#         axes[1, 0].set_ylabel('FDE')
+#         axes[1, 0].grid(True)
+    
+#     # Uncertainty metrics (if available)
+#     if 'Avg_Uncertainty' in val_metrics_history:
+#         axes[1, 1].plot(val_metrics_history['Avg_Uncertainty'])
+#         axes[1, 1].set_title('Average Uncertainty')
+#         axes[1, 1].set_xlabel('Epoch')
+#         axes[1, 1].set_ylabel('Uncertainty')
+#         axes[1, 1].grid(True)
+    
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=300, bbox_inches='tight')
+#     plt.close()
+
+# def main():
+#     """Main training function"""
+#     # Configuration
+#     config = {
+#         'drone_data_root': "../../square_stanford_data",
+#         'original_dataset_root': "../../stanford_data/archive",
+#         'classes': ['Pedestrian','Biker','Skater','Cart','Car','Bus'],
+        
+#         # Model parameters
+#         'model_params': {
+#             'd_model': 64,
+#             'nhead': 8,
+#             'num_layers': 1,
+#             'T_past': 10,
+#             'T_future': 10,
+#             'use_deltas': True,
+#             'predict_uncertainty': True
+#         },
+        
+#         # Training parameters
+#         'batch_size': 32,
+#         'num_epochs': 10,
+#         'learning_rate': 1e-4,
+#         'weight_decay': 1e-5,
+#         'scheduler_type': 'cosine',  # 'cosine', 'step', 'plateau', or None
+        
+#         # Loss parameters
+#         'loss_params': {
+#             'use_deltas': True,
+#             'predict_uncertainty': True,
+#             'position_weight': 1.0,
+#             'delta_weight': 1.0,
+#             'uncertainty_weight': 0.1
+#         },
+        
+#         # Data parameters
+#         'normalize_positions': False,
+#         'train_split': 0.1,
+#         'val_split': 0.9,
+#         'num_workers': 4,
+        
+#         # Checkpointing
+#         'save_dir': './checkpoints',
+#         'save_every_epoch': True,
+#         'early_stopping_patience': 5
+#     }
+    
+#     # Setup
+#     device = setup_device()
+#     os.makedirs(config['save_dir'], exist_ok=True)
+    
+#     # Save configuration
+#     with open(os.path.join(config['save_dir'], 'config.json'), 'w') as f:
+#         json.dump(config, f, indent=2)
+    
+#     # Create data loaders
+#     train_loader, val_loader, dataset = create_data_loaders(
+#         drone_data_root=config['drone_data_root'],
+#         original_dataroot=config['original_dataset_root'],
+#         classes=config['classes'],
+#         T_past=config['model_params']['T_past'],
+#         T_future=config['model_params']['T_future'],
+#         use_deltas=config['model_params']['use_deltas'],
+#         normalize_positions=config['normalize_positions'],
+#         batch_size=config['batch_size'],
+#         train_split=config['train_split'],
+#         val_split=config['val_split'],
+#         num_workers=config['num_workers']
+#     )
+    
+#     # Define locations for model initialization
+#     locations = [
+#         "bookstore",
+#         "coupa",
+#         "deathCircle",
+#         "gates",
+#         "hyang",
+#         "little",
+#         "nexus",
+#         "quad",
+#     ]
+    
+#     # Initialize model
+#     model = initialize_model(
+#         num_classes=len(config['classes']),
+#         locations=locations,
+#         device=device,
+#         d_model=config['model_params']['d_model'],
+#         num_layers=config['model_params']['num_layers'],
+#         T_past=config['model_params']['T_past'],
+#         T_future=config['model_params']['T_future']
+#     )
+    
+#     # Create loss function
+#     loss_fn = TrajectoryLoss(**config['loss_params'])
+    
+#     # Create optimizer and scheduler
+#     optimizer, scheduler = create_optimizer_scheduler(
+#         model=model,
+#         learning_rate=config['learning_rate'],
+#         weight_decay=config['weight_decay'],
+#         scheduler_type=config['scheduler_type'],
+#         num_epochs=config['num_epochs']
+#     )
+    
+#     # Training history
+#     train_losses_history = defaultdict(list)
+#     val_losses_history = defaultdict(list)
+#     val_metrics_history = defaultdict(list)
+    
+#     best_val_loss = float('inf')
+#     epochs_without_improvement = 0
+    
+#     print(f"\nStarting training for {config['num_epochs']} epochs...")
+#     print(f"Device: {device}")
+#     print(f"Batch size: {config['batch_size']}")
+#     print(f"Learning rate: {config['learning_rate']}")
+#     print("-" * 50)
+    
+#     for epoch in range(config['num_epochs']):
+#         start_time = time.time()
+        
+#         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
+        
+#         # Train
+#         train_losses = train_epoch(
+#             model=model,
+#             train_loader=train_loader,
+#             loss_fn=loss_fn,
+#             optimizer=optimizer,
+#             device=device,
+#             use_teacher_forcing=True
+#         )
+        
+#         # Validate
+#         val_losses, val_metrics = validate_epoch(
+#             model=model,
+#             val_loader=val_loader,
+#             loss_fn=loss_fn,
+#             device=device,
+#             dataset=dataset
+#         )
+        
+#         # Update learning rate
+#         if scheduler is not None:
+#             if config['scheduler_type'] == 'plateau':
+#                 scheduler.step(val_losses['total_loss'])
+#             else:
+#                 scheduler.step()
+        
+#         # Record history
+#         for key, value in train_losses.items():
+#             train_losses_history[key].append(value)
+        
+#         for key, value in val_losses.items():
+#             val_losses_history[key].append(value)
+        
+#         for key, value in val_metrics.items():
+#             val_metrics_history[key].append(value)
+        
+#         # Print epoch results
+#         epoch_time = time.time() - start_time
+#         print(f"Epoch {epoch + 1} completed in {epoch_time:.1f}s")
+#         print(f"Train Loss: {train_losses['total_loss']:.4f}")
+#         print(f"Val Loss: {val_losses['total_loss']:.4f}")
+#         if 'ADE' in val_metrics:
+#             print(f"Val ADE: {val_metrics['ADE']:.4f}")
+#         if 'FDE' in val_metrics:
+#             print(f"Val FDE: {val_metrics['FDE']:.4f}")
+        
+#         # Save checkpoint
+#         is_best = val_losses['total_loss'] < best_val_loss
+#         if is_best:
+#             best_val_loss = val_losses['total_loss']
+#             epochs_without_improvement = 0
+#         else:
+#             epochs_without_improvement += 1
+        
+#         if config['save_every_epoch'] or is_best:
+#             save_checkpoint(
+#                 model=model,
+#                 optimizer=optimizer,
+#                 scheduler=scheduler,
+#                 epoch=epoch + 1,
+#                 train_losses=train_losses_history,
+#                 val_losses=val_losses_history,
+#                 val_metrics=val_metrics_history,
+#                 save_dir=config['save_dir'],
+#                 is_best=is_best
+#             )
+        
+#         # Plot training curves every 5 epochs
+#         if (epoch + 1) % 5 == 0:
+#             plot_training_curves(
+#                 train_losses_history, val_losses_history, 
+#                 val_metrics_history, config['save_dir']
+#             )
+        
+#         # Early stopping
+#         if epochs_without_improvement >= config['early_stopping_patience']:
+#             print(f"\nEarly stopping after {config['early_stopping_patience']} epochs without improvement")
+#             break
+    
+#     print("\nTraining completed!")
+#     print(f"Best validation loss: {best_val_loss:.4f}")
+    
+#     # Save final results
+#     final_results = {
+#         'best_val_loss': best_val_loss,
+#         'training_history': {
+#             'train_losses': train_losses_history,
+#             'val_losses': val_losses_history,
+#             'val_metrics': val_metrics_history
+#         }
+#     }
+    
+#     with open(os.path.join(config['save_dir'], 'final_results.json'), 'w') as f:
+#         # Convert numpy types to Python types for JSON serialization
+#         def convert_numpy(obj):
+#             if isinstance(obj, np.ndarray):
+#                 return obj.tolist()
+#             elif isinstance(obj, np.generic):
+#                 return obj.item()
+#             elif isinstance(obj, dict):
+#                 return {k: convert_numpy(v) for k, v in obj.items()}
+#             elif isinstance(obj, list):
+#                 return [convert_numpy(v) for v in obj]
+#             return obj
+        
+#         json.dump(convert_numpy(final_results), f, indent=2)
+
+# if __name__ == "__main__":
+#     main()
