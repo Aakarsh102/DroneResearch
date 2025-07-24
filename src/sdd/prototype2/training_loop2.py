@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 warnings.filterwarnings('ignore')
 
- # Module-level functions for multiprocessing
 def process_drone_location_worker(args):
     """Worker function for processing drone location data"""
     drone_root, loc = args
@@ -57,7 +56,7 @@ def process_drone_location_worker(args):
 
 def process_video_worker(args):
     """Worker function for processing video data"""
-    loc, vid, obs_sets, orig_root, classes, cls2idx, T_past, T_future = args
+    loc, vid, obs_sets, orig_root, classes, cls2idx, T_past, T_future, frame_subsample = args
     orig_file = os.path.join(orig_root, "annotations", loc, vid, "annotations.txt")
     
     if not os.path.isfile(orig_file):
@@ -94,28 +93,58 @@ def process_video_worker(args):
             L = len(frames)
             window = T_past + T_future
             
-            for i in range(L - window + 1):
-                # Check frame continuity
-                if frames[i + T_past - 1] - frames[i] != T_past - 1:
-                    continue
-                if frames[i + window - 1] - frames[i + T_past] != T_future - 1:
-                    continue
-                
-                # Check observation requirement
-                if obs_mask[i:i + T_past].sum() < 2:
-                    continue
-                
-                # Store sample index instead of full data
-                sample_idx = {
-                    'location': loc,
-                    'video': vid,
-                    'track_id': tid,
-                    'start_idx': i,
-                    'window_size': window,
-                    'label': cls2idx[grp.iloc[i + T_past - 1]['label']]
-                }
-                
-                indices.append(sample_idx)
+            # NEW: Frame subsampling logic
+            # Generate all possible starting frame offsets (0 to frame_subsample-1)
+            for frame_offset in range(frame_subsample):
+                for i in range(L - (window - 1) * frame_subsample - frame_offset):
+                    # Calculate the subsampled frame indices
+                    subsampled_indices = []
+                    subsampled_frames = []
+                    
+                    for j in range(window):
+                        target_idx = i + frame_offset + j * frame_subsample
+                        if target_idx >= L:
+                            break
+                        subsampled_indices.append(target_idx)
+                        subsampled_frames.append(frames[target_idx])
+                    
+                    # Check if we have enough frames for the full window
+                    if len(subsampled_indices) < window:
+                        continue
+                    
+                    # Check frame continuity with subsampling
+                    expected_frame_diff = frame_subsample
+                    valid_sequence = True
+                    
+                    for j in range(1, len(subsampled_frames)):
+                        actual_diff = subsampled_frames[j] - subsampled_frames[j-1]
+                        # Allow some tolerance for missing frames
+                        if abs(actual_diff - expected_frame_diff) > frame_subsample // 2:
+                            valid_sequence = False
+                            break
+                    
+                    if not valid_sequence:
+                        continue
+                    
+                    # Check observation requirement for past frames
+                    past_indices = subsampled_indices[:T_past]
+                    if obs_mask[past_indices].sum() < 2:
+                        continue
+                    
+                    # Store sample index instead of full data
+                    sample_idx = {
+                        'location': loc,
+                        'video': vid,
+                        'track_id': tid,
+                        'start_idx': i,
+                        'frame_offset': frame_offset,
+                        'subsampled_indices': subsampled_indices,
+                        'subsampled_frames': subsampled_frames,
+                        'window_size': window,
+                        'label': cls2idx[grp.iloc[subsampled_indices[T_past - 1]]['label']]
+                    }
+                    
+                    indices.append(sample_idx)
                 
     except Exception as e:
         print(f"Error processing {loc}/{vid}: {e}")
@@ -167,11 +196,13 @@ def process_location_stats_worker(args):
             print(f"Error processing {video_key}: {e}")
     
     return loc_stats
+
 class OptimizedMultiAgentSequenceDataset(Dataset):
     def __init__(self, drone_data_root, original_dataset_root, classes,
                  T_past=10, T_future=10, use_deltas=True, normalize_positions=True,
                  cache_dir="dataset_cache", lazy_loading=True, num_workers=4,
-                 max_agents=20, min_frames_per_agent=2, pad_value=-999.0):
+                 max_agents=20, min_frames_per_agent=2, pad_value=-999.0,
+                 frame_subsample=12):  # NEW: Frame subsampling parameter
         self.drone_data_root = drone_data_root
         self.orig_root = original_dataset_root
         self.classes = classes
@@ -185,6 +216,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         self.max_agents = max_agents
         self.min_frames_per_agent = self.T_past
         self.pad_value = pad_value  # Value used for padding missing agents/frames
+        self.frame_subsample = frame_subsample  # NEW: Subsample every Nth frame
         self.obs_sets = None  # Will be populated during dataset building
 
         self.cache_dir = Path(cache_dir)
@@ -203,7 +235,8 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             'normalize_positions': self.normalize_positions,
             'classes': sorted(self.classes),
             'max_agents': self.max_agents,
-            'min_frames_per_agent': self.min_frames_per_agent
+            'min_frames_per_agent': self.min_frames_per_agent,
+            'frame_subsample': self.frame_subsample  # NEW: Include in cache signature
         }
         
         if cache_info_file.exists():
@@ -237,7 +270,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                 self.sample_indices = pkl.load(f)
 
             if self.normalize_positions:
-                stats_file = self.cache_dir / "vides_stats.pkl"
+                stats_file = self.cache_dir / "video_stats.pkl"  # Fixed typo
                 with open(stats_file, "rb") as f:
                     self.video_stats = pkl.load(f)
         else:
@@ -264,9 +297,8 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             self.samples = self._build_multi_agent_samples_parallel(self.obs_sets)
             self._cache_samples()
 
-
     def _build_multi_agent_sample_indices_parallel(self, obs_sets):
-        """Build sample indices for multi-agent trajectories with lazy loading"""
+        """Build sample indices for multi-agent trajectories with lazy loading and frame subsampling"""
         def process_video(args):
             loc, vid, obs_sets = args
             orig_file = os.path.join(self.orig_root, "annotations", loc, vid, "annotations.txt")
@@ -289,57 +321,73 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                 # Get all unique frames
                 all_frames = sorted(df['frame'].unique())
                 window_size = self.T_past + self.T_future
-                for start_frame_idx in range(len(all_frames) - window_size + 1):
-                    start_frame = all_frames[start_frame_idx]
-                    end_frame = all_frames[start_frame_idx + window_size - 1]
+                
+                # NEW: Frame subsampling logic for multi-agent
+                # Try different starting offsets for subsampling
+                for frame_offset in range(self.frame_subsample):
+                    # Calculate how many subsampled windows we can fit
+                    max_subsampled_windows = (len(all_frames) - frame_offset) // self.frame_subsample
                     
-                    if end_frame - start_frame > window_size + 5:  # Allow some gaps
-                        continue
+                    for start_subsample_idx in range(max_subsampled_windows - window_size + 1):
+                        # Calculate the actual frame indices we'll use
+                        window_frame_indices = []
+                        window_frames = []
+                        
+                        for j in range(window_size):
+                            frame_idx = frame_offset + (start_subsample_idx + j) * self.frame_subsample
+                            if frame_idx < len(all_frames):
+                                window_frame_indices.append(frame_idx)
+                                window_frames.append(all_frames[frame_idx])
+                        
+                        if len(window_frames) < window_size:
+                            continue
 
-                    window_frames = all_frames[start_frame_idx:start_frame_idx + window_size]
-                    past_frames = window_frames[:self.T_past]
-                    future_frames = window_frames[self.T_past:]
+                        past_frames = window_frames[:self.T_past]
+                        future_frames = window_frames[self.T_past:]
 
-                    window_df = df[df['frame'].isin(window_frames)]
+                        window_df = df[df['frame'].isin(window_frames)]
 
-                    if (len(window_frames) == 0): continue
+                        if len(window_frames) == 0:
+                            continue
 
-                    # Find agents that meet minimum frame requirement
-                    valid_agents = []
-                    agent_data = {}
+                        # Find agents that meet minimum frame requirement
+                        valid_agents = []
+                        agent_data = {}
 
-                    for tid, agent_df in window_df.groupby('trackId'):
-                        agent_frames = set(agent_df['frame'].values)
-                        past_frames_count = len([f for f in past_frames if f in agent_frames])
-                        future_frames_count = len([f for f in future_frames if f in agent_frames])
+                        for tid, agent_df in window_df.groupby('trackId'):
+                            agent_frames = set(agent_df['frame'].values)
+                            past_frames_count = len([f for f in past_frames if f in agent_frames])
+                            future_frames_count = len([f for f in future_frames if f in agent_frames])
 
-                        if (len(past_frames) >= self.min_frames_per_agent):
-                            obs_mask = np.array([1.0 if (tid, int(f)) in seen else 0.0 
-                                               for f in past_frames if f in agent_frames])
-                            if obs_mask.sum() >= 2:
-                                valid_agents.append(tid)
-                                agent_data[tid] = {
-                                    'past_frames': past_frames_count,
-                                    'future_frames': future_frames_count,
-                                    'obs_count': obs_mask.sum()
-                                }
+                            if past_frames_count >= self.min_frames_per_agent:
+                                obs_mask = np.array([1.0 if (tid, int(f)) in seen else 0.0 
+                                                   for f in past_frames if f in agent_frames])
+                                if obs_mask.sum() >= 2:
+                                    valid_agents.append(tid)
+                                    agent_data[tid] = {
+                                        'past_frames': past_frames_count,
+                                        'future_frames': future_frames_count,
+                                        'obs_count': obs_mask.sum()
+                                    }
 
-                    if len(valid_agents) == 0:
-                        continue
-                    
-                    # Create sample index
-                    sample_idx = {
-                        'location': loc,
-                        'video': vid,
-                        'start_frame': start_frame,
-                        'end_frame': end_frame,
-                        'window_frames': window_frames,
-                        'valid_agents': valid_agents,
-                        'agent_data': agent_data,
-                        'num_agents': len(valid_agents)
-                    }
+                        if len(valid_agents) == 0:
+                            continue
+                        
+                        # Create sample index
+                        sample_idx = {
+                            'location': loc,
+                            'video': vid,
+                            'start_frame': window_frames[0],
+                            'end_frame': window_frames[-1],
+                            'window_frames': window_frames,
+                            'frame_offset': frame_offset,  # NEW: Store frame offset
+                            'subsample_start_idx': start_subsample_idx,  # NEW: Store subsample start
+                            'valid_agents': valid_agents,
+                            'agent_data': agent_data,
+                            'num_agents': len(valid_agents)
+                        }
 
-                    indices.append(sample_idx)
+                        indices.append(sample_idx)
             except Exception as e:
                 print(f"Error processing {loc}/{vid}: {e}")
             return indices
@@ -442,7 +490,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         
         return video_stats
     
-    def _build_sample_indices_parallel(self) -> Dict:
+    def _build_obs_sets_parallel(self) -> Dict:
         """Build observation sets using parallel processing"""
         locations = [d for d in os.listdir(self.drone_data_root) 
                     if os.path.isdir(os.path.join(self.drone_data_root, d))]
@@ -456,8 +504,6 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
 
         return merged_obs
 
-
-
     def _cache_samples(self):
         """Cache all samples to disk"""
         with open(self.cache_dir / "all_samples.pkl", 'wb') as f:
@@ -467,7 +513,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
     def _load_trajectory_data(self, video_key: str, track_id: int):
         hdf5_file = self.cache_dir / "multi_agent_trajectory_data.h5"
 
-        with open(hdf5_file, 'rb') as f:
+        with h5py.File(hdf5_file, 'r') as f:  # Fixed: use h5py.File instead of open
             if video_key not in f:
                 return None
             track_grp = f[video_key][str(track_id)]
@@ -511,9 +557,9 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         return self._load_multi_agent_sample_on_demand(sample_idx)
 
     def _load_multi_agent_sample_on_demand(self, sample_idx):
-        """Load multi-agent sample on demand from HDF5"""
+        """Load multi-agent sample on demand from HDF5 with frame subsampling"""
         video_key = f"{sample_idx['location']}_{sample_idx['video']}"
-        window_frames = sample_idx['window_frames']
+        window_frames = sample_idx['window_frames']  # These are already subsampled frames
         valid_agents = sample_idx['valid_agents']
         
         past_frames = window_frames[:self.T_past]
@@ -557,7 +603,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             # Create frame to index mapping for this track
             frame_to_idx = {frame: idx for idx, frame in enumerate(track_data['frames'])}
             
-            # Fill past positions
+            # Fill past positions (using subsampled frames)
             for t, frame in enumerate(past_frames):
                 if frame in frame_to_idx:
                     data_idx = frame_to_idx[frame]
@@ -579,7 +625,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                         if label in self.cls2idx:
                             agent_labels[agent_idx] = self.cls2idx[label]
             
-            # Fill future positions
+            # Fill future positions (using subsampled frames)
             for t, frame in enumerate(future_frames):
                 if frame in frame_to_idx:
                     data_idx = frame_to_idx[frame]
@@ -627,10 +673,12 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             'location': sample_idx['location'],
             'video': sample_idx['video'],
             'start_frame': sample_idx['start_frame'],
-            'num_valid_agents': num_agents
+            'num_valid_agents': num_agents,
+            'subsampled_frames': window_frames,  # NEW: Store the actual subsampled frame numbers
+            'frame_subsample_rate': self.frame_subsample  # NEW: Store subsample rate for reference
         }
         
-        # Add delta features if requested
+        # Add delta features if requested (adjusted for subsampling)
         if self.use_deltas:
             past_deltas = np.zeros((self.max_agents, self.T_past, 2), dtype=np.float32)
             future_deltas = np.zeros((self.max_agents, self.T_future, 2), dtype=np.float32)
@@ -644,6 +692,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                     future_mask = temporal_masks_future[agent_idx]
                     
                     # Past deltas - calculate between consecutive valid frames
+                    # NOTE: With subsampling, these deltas represent movement over frame_subsample frames
                     valid_past_indices = np.where(past_mask > 0)[0]
                     if len(valid_past_indices) > 1:
                         for i in range(1, len(valid_past_indices)):
@@ -682,8 +731,14 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         """Format sample for model consumption"""
         # Convert to tensors if needed
         return sample
+
+
+
+
+if __name__ == "__main__":
+    dataset = OptimizedMultiAgentSequenceDataset("/Users/aakarshrai/Desktop/square_stanford_data",
+                                                 "/Users/aakarshrai/Desktop/stanford_data/archive",
+                                                 ['Pedestrian','Biker','Skater','Cart','Car','Bus'],
+                                                 10, 20, cache_dir = "new_cache", max_agents = 256)
     
-
-
-
-
+    
