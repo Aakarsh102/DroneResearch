@@ -355,12 +355,12 @@ def main():
     visualizer = DroneVisualizer("stanford_data/archive")
     
     # Example: Visualize drone positions for bookstore location
-    location = "bookstore"
+    location = "deathCircle"
     drone_positions = [
-        (300, 200),
-        (700, 200),
-        (300, 600),
-        (700, 600),
+        (650, 350),
+        (1050, 1000),
+        (650, 1500),
+        (350, 1000),
     ]
     fov_side = 360  # Square side length
     
@@ -415,7 +415,10 @@ if __name__ == "__main__":
     # fov_side = 420  # Square side length
     location = "deathCircle"
     drone_positions = [
-        (690.5, 259),
+        (650, 350),
+        (1050, 1000),
+        (650, 1500),
+        (350, 1000),
 
         ]
     fov_side = 420  # Square side length

@@ -17,6 +17,7 @@ from functools import lru_cache
 import h5py
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from model2 import GraphInteractionModel
 warnings.filterwarnings('ignore')
 
 def process_drone_location_worker(args):
@@ -733,12 +734,509 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         return sample
 
 
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+import wandb
+import numpy as np
+from pathlib import Path
+import json
+import time
+from tqdm import tqdm
+import argparse
+
+# Assuming your dataset and model classes are imported
+# from your_dataset_module import OptimizedMultiAgentSequenceDataset
+# from your_model_module import GraphInteractionModel
+
+class TrajectoryLoss(nn.Module):
+    """Loss function for trajectory prediction with uncertainty and proper masking"""
+    
+    def __init__(self, use_deltas=True, predict_uncertainty=True, 
+                 position_weight=1.0, delta_weight=1.0, uncertainty_weight=0.1):
+        super().__init__()
+        self.use_deltas = use_deltas
+        self.predict_uncertainty = predict_uncertainty
+        self.position_weight = position_weight
+        self.delta_weight = delta_weight
+        self.uncertainty_weight = uncertainty_weight
+        
+    def forward(self, predictions, batch):
+        total_loss = 0.0
+        loss_dict = {}
+        
+        # Extract masks from batch
+        # temporal_masks_future: (batch, max_agents, T_future) - 1 if agent exists at timestep
+        # occ_masks: (batch, max_agents, T_future) - occlusion values (only valid where agent exists)
+        # agent_masks: (batch, max_agents) - 1 if agent slot is used
+        
+        temporal_mask = batch['temporal_masks_future']  # (batch, max_agents, T_future)
+        occ_mask = batch['occ_masks']  # (batch, max_agents, T_future) 
+        agent_mask = batch['agent_masks']  # (batch, max_agents)
+        
+        # Create visibility mask: 1 for visible (non-occluded) positions where agent exists
+        # Assuming occ_mask values: 0 = visible, 1 = occluded (adjust if different)
+        visibility_mask = temporal_mask * (1.0 - occ_mask)  # (batch, max_agents, T_future)
+        
+        # Also mask out padded agents
+        agent_mask_expanded = agent_mask.unsqueeze(-1).expand_as(visibility_mask)
+        valid_mask = visibility_mask * agent_mask_expanded
+        
+        if self.predict_uncertainty:
+            # Negative log likelihood loss for positions
+            if 'future_positions_mu' in predictions and 'future_positions_logvar' in predictions:
+                pos_mu = predictions['future_positions_mu']  # (batch, max_agents, T_future, 2)
+                pos_logvar = predictions['future_positions_logvar']  # (batch, max_agents, T_future, 2)
+                pos_target = batch['future_positions']  # (batch, max_agents, T_future, 2)
+                
+                pos_loss = self._gaussian_nll_loss(pos_mu, pos_logvar, pos_target, valid_mask)
+                loss_dict['position_loss'] = pos_loss
+                total_loss += self.position_weight * pos_loss
+            
+            # Negative log likelihood loss for deltas
+            if self.use_deltas and 'future_deltas_mu' in predictions and 'future_deltas_logvar' in predictions:
+                delta_mu = predictions['future_deltas_mu']
+                delta_logvar = predictions['future_deltas_logvar']
+                delta_target = batch['future_deltas']
+                
+                delta_loss = self._gaussian_nll_loss(delta_mu, delta_logvar, delta_target, valid_mask)
+                loss_dict['delta_loss'] = delta_loss
+                total_loss += self.delta_weight * delta_loss
+            
+            # Uncertainty regularization
+            if 'future_positions_logvar' in predictions:
+                pos_logvar = predictions['future_positions_logvar']
+                # Apply mask to only regularize visible positions
+                masked_logvar = pos_logvar * valid_mask.unsqueeze(-1).expand_as(pos_logvar)
+                # Regularize towards reasonable uncertainty
+                uncertainty_reg = torch.mean(masked_logvar ** 2) 
+                loss_dict['uncertainty_reg'] = uncertainty_reg
+                total_loss += self.uncertainty_weight * uncertainty_reg
+                
+        else:
+            # Standard MSE loss
+            if 'future_positions' in predictions:
+                pos_loss = self._masked_mse_loss(
+                    predictions['future_positions'], batch['future_positions'], valid_mask
+                )
+                loss_dict['position_loss'] = pos_loss
+                total_loss += self.position_weight * pos_loss
+            
+            if self.use_deltas and 'future_deltas' in predictions:
+                delta_loss = self._masked_mse_loss(
+                    predictions['future_deltas'], batch['future_deltas'], valid_mask
+                )
+                loss_dict['delta_loss'] = delta_loss
+                total_loss += self.delta_weight * delta_loss
+        
+        loss_dict['total_loss'] = total_loss
+        return total_loss, loss_dict
+    
+    def _gaussian_nll_loss(self, mu, logvar, target, mask):
+        """
+        Negative log likelihood for Gaussian distribution
+        
+        Args:
+            mu: predicted mean (batch, max_agents, T_future, 2)
+            logvar: predicted log variance (batch, max_agents, T_future, 2) 
+            target: ground truth (batch, max_agents, T_future, 2)
+            mask: validity mask (batch, max_agents, T_future) - 1 for valid, 0 for invalid
+        """
+        # Expand mask to match tensor dimensions
+        mask_expanded = mask.unsqueeze(-1).expand_as(mu)  # (batch, max_agents, T_future, 2)
+        
+        # Compute NLL
+        var = torch.exp(logvar)  # Convert log variance to variance
+        squared_error = (target - mu) ** 2
+        nll = 0.5 * (logvar + squared_error / (var + 1e-8))  # Add epsilon for stability
+        
+        # Apply mask - only compute loss for valid positions
+        masked_nll = nll * mask_expanded
+        
+        # Return average loss over valid positions
+        valid_count = mask_expanded.sum()
+        if valid_count > 0:
+            return masked_nll.sum() / valid_count
+        else:
+            return torch.tensor(0.0, device=mu.device, requires_grad=True)
+    
+    def _masked_mse_loss(self, pred, target, mask):
+        """MSE loss with masking for invalid positions"""
+        mask_expanded = mask.unsqueeze(-1).expand_as(pred)
+        mse = ((pred - target) ** 2) * mask_expanded
+        
+        valid_count = mask_expanded.sum()
+        if valid_count > 0:
+            return mse.sum() / valid_count
+        else:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+
+
+class EarlyStopping:
+    """Early stopping utility"""
+    def __init__(self, patience=10, min_delta=0.0, restore_best_weights=True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.best_weights = None
+        
+    def __call__(self, val_loss, model):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.restore_best_weights:
+                self.best_weights = model.state_dict().copy()
+        else:
+            self.counter += 1
+            
+        if self.counter >= self.patience:
+            if self.restore_best_weights and self.best_weights is not None:
+                model.load_state_dict(self.best_weights)
+            return True
+        return False
+
+
+def collate_fn(batch):
+    """Custom collate function for batching"""
+    # Stack all tensors
+    batched = {}
+    for key in batch[0].keys():
+        if isinstance(batch[0][key], torch.Tensor):
+            batched[key] = torch.stack([item[key] for item in batch])
+        elif isinstance(batch[0][key], np.ndarray):
+            batched[key] = torch.from_numpy(np.stack([item[key] for item in batch]))
+        else:
+            # For non-tensor data like strings, lists, etc.
+            batched[key] = [item[key] for item in batch]
+    
+    return batched
+
+
+def evaluate_model(model, dataloader, criterion, device):
+    """Evaluate model on validation set"""
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    loss_dict_accum = {}
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Validating"):
+            # Move batch to device
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value.to(device)
+            
+            # Forward pass
+            predictions = model(batch, use_teacher_forcing=False)  # No teacher forcing during validation
+            
+            # Compute loss
+            loss, loss_dict = criterion(predictions, batch)
+            
+            batch_size = batch['past_positions'].size(0)
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+            
+            # Accumulate loss components
+            for key, value in loss_dict.items():
+                if key not in loss_dict_accum:
+                    loss_dict_accum[key] = 0.0
+                loss_dict_accum[key] += value.item() * batch_size
+    
+    # Average losses
+    avg_loss = total_loss / total_samples
+    for key in loss_dict_accum:
+        loss_dict_accum[key] /= total_samples
+    
+    return avg_loss, loss_dict_accum
+
+
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
+    """Train model for one epoch"""
+    model.train()
+    total_loss = 0.0
+    total_samples = 0
+    loss_dict_accum = {}
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    for batch_idx, batch in enumerate(pbar):
+        # Move batch to device
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                batch[key] = value.to(device)
+        
+        # Forward pass
+        predictions = model(batch, use_teacher_forcing=True)  # Use teacher forcing during training
+        
+        # Compute loss
+        loss, loss_dict = criterion(predictions, batch)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping (optional but recommended for sequence models)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+        
+        # Accumulate statistics
+        batch_size = batch['past_positions'].size(0)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+        
+        for key, value in loss_dict.items():
+            if key not in loss_dict_accum:
+                loss_dict_accum[key] = 0.0
+            loss_dict_accum[key] += value.item() * batch_size
+        
+        # Update progress bar
+        pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+    
+    # Average losses
+    avg_loss = total_loss / total_samples
+    for key in loss_dict_accum:
+        loss_dict_accum[key] /= total_samples
+    
+    return avg_loss, loss_dict_accum
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train Multi-Agent Trajectory Prediction Model')
+    parser.add_argument('--drone_data_root', type=str, required=True, 
+                       help='Path to drone data root directory')
+    parser.add_argument('--original_dataset_root', type=str, required=True,
+                       help='Path to original dataset root directory')
+    parser.add_argument('--cache_dir', type=str, default='dataset_cache',
+                       help='Directory for dataset cache')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                       help='Directory to save model checkpoints')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
+    parser.add_argument('--patience', type=int, default=15, help='Early stopping patience')
+    parser.add_argument('--val_split', type=float, default=0.2, help='Validation split ratio')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of data loader workers')
+    parser.add_argument('--max_agents', type=int, default=128, help='Maximum number of agents')
+    parser.add_argument('--T_past', type=int, default=10, help='Past time steps')
+    parser.add_argument('--T_future', type=int, default=20, help='Future time steps')
+    parser.add_argument('--frame_subsample', type=int, default=12, help='Frame subsampling rate')
+    parser.add_argument('--wandb_project', type=str, default='trajectory-prediction',
+                       help='Weights & Biases project name')
+    parser.add_argument('--run_name', type=str, default=None, help='Run name for logging')
+    
+    args = parser.parse_args()
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create checkpoint directory
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(exist_ok=True)
+    
+    # Initialize wandb
+    wandb.init(
+        project=args.wandb_project,
+        name=args.run_name,
+        config=vars(args)
+    )
+    
+    # Dataset configuration
+    classes = ['Pedestrian', 'Biker', 'Skater', 'Cart', 'Car', 'Bus']
+    locations = ['bookstore', 'coupa', 'deathCircle', 'gates', 'hyang', 'nexus', 'quad']  # Update with your actual locations
+    
+    print("Loading dataset...")
+    dataset = OptimizedMultiAgentSequenceDataset(
+        drone_data_root=args.drone_data_root,
+        original_dataset_root=args.original_dataset_root,
+        classes=classes,
+        T_past=args.T_past,
+        T_future=args.T_future,
+        use_deltas=True,
+        normalize_positions=True,
+        cache_dir=args.cache_dir,
+        lazy_loading=True,
+        num_workers=args.num_workers,
+        max_agents=args.max_agents,
+        frame_subsample=args.frame_subsample
+    )
+    
+    print(f"Dataset loaded with {len(dataset)} samples")
+    
+    # Split dataset
+    val_size = int(len(dataset) * args.val_split)
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = random_split(
+        dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    
+    # Initialize model
+    print("Initializing model...")
+    model = GraphInteractionModel(
+        num_classes=len(classes),
+        locations=locations,  
+        d_model=256,
+        nhead=8,
+        num_layers=6,
+        T_past=args.T_past,
+        T_future=args.T_future,
+        max_agents=args.max_agents
+    )
+    
+    model = model.to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Initialize loss function and optimizer
+    criterion = TrajectoryLoss(
+        use_deltas=True,
+        predict_uncertainty=True,
+        position_weight=1.0,
+        delta_weight=1.0,
+        uncertainty_weight=0.1
+    )
+    
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay
+    )
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+    )
+    
+    # Early stopping
+    early_stopping = EarlyStopping(patience=args.patience, min_delta=1e-4)
+    
+    # Training loop
+    best_val_loss = float('inf')
+    
+    print("Starting training...")
+    for epoch in range(1, args.num_epochs + 1):
+        start_time = time.time()
+        
+        # Train
+        train_loss, train_loss_dict = train_epoch(
+            model, train_loader, criterion, optimizer, device, epoch
+        )
+        
+        # Validate
+        val_loss, val_loss_dict = evaluate_model(
+            model, val_loader, criterion, device
+        )
+        
+        # Update learning rate
+        scheduler.step(val_loss)
+        
+        epoch_time = time.time() - start_time
+        
+        # Log metrics
+        metrics = {
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'epoch_time': epoch_time,
+            'learning_rate': optimizer.param_groups[0]['lr']
+        }
+        
+        # Add detailed loss components
+        for key, value in train_loss_dict.items():
+            metrics[f'train_{key}'] = value
+        for key, value in val_loss_dict.items():
+            metrics[f'val_{key}'] = value
+        
+        wandb.log(metrics)
+        
+        print(f"Epoch {epoch}/{args.num_epochs}")
+        print(f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        print(f"Time: {epoch_time:.2f}s, LR: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Save checkpoint every epoch
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            'args': vars(args)
+        }
+        
+        torch.save(checkpoint, checkpoint_dir / f'checkpoint_epoch_{epoch}.pth')
+        
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(checkpoint, checkpoint_dir / 'best_model.pth')
+            print(f"New best model saved with val_loss: {val_loss:.6f}")
+        
+        # Early stopping check
+        if early_stopping(val_loss, model):
+            print(f"Early stopping triggered after {epoch} epochs")
+            break
+        
+        print("-" * 50)
+    
+    # Save final model
+    final_checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'best_val_loss': best_val_loss,
+        'args': vars(args)
+    }
+    torch.save(final_checkpoint, checkpoint_dir / 'final_model.pth')
+    
+    print("Training completed!")
+    print(f"Best validation loss: {best_val_loss:.6f}")
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":
-    dataset = OptimizedMultiAgentSequenceDataset("/Users/aakarshrai/Desktop/square_stanford_data",
-                                                 "/Users/aakarshrai/Desktop/stanford_data/archive",
-                                                 ['Pedestrian','Biker','Skater','Cart','Car','Bus'],
-                                                 10, 20, cache_dir = "new_cache", max_agents = 256)
+    main()
+
+
+# if __name__ == "__main__":
+#     dataset = OptimizedMultiAgentSequenceDataset("/Users/aakarshrai/Desktop/square_stanford_data",
+#                                                  "/Users/aakarshrai/Desktop/stanford_data/archive",
+#                                                  ['Pedestrian','Biker','Skater','Cart','Car','Bus'],
+#                                                  10, 20, cache_dir = "new_cache", max_agents = 128)
     
     
