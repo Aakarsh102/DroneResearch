@@ -19,3 +19,7 @@ src/argoverse2/enhanced_drone_datasets_final/
 stanfrord_data/
 square_standford_data/
 starcraft_motion_dataset/
+src/sdd/prototype1/models/
+src/sdd/prototype2/models/
+srd/sdd/__pycache__/
+dataset_cache/
