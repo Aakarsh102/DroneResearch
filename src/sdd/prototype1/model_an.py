@@ -15,20 +15,32 @@ def denormalize_positions(normalized_coords, video_stats):
         return normalized_coords * std + mean
     else:
         return normalized_coords * video_stats['std'] + video_stats['mean']
+    
 
+
+# 1. REPLACE PositionalEncoding class
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len = 1000):
+    def __init__(self, d_model, max_len=1000):
         super(PositionalEncoding, self).__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000)/d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        # For batch_first=True, we want (1, max_len, d_model) not (max_len, 1, d_model)
+        pe = pe.unsqueeze(0)  # Shape: (1, max_len, d_model)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        return x + self.pe[:x.size(0), :]
+        """
+        x: (batch_size, seq_len, d_model) when batch_first=True
+        """
+        batch_size, seq_len, d_model = x.shape
+        # Take the first seq_len positions from our precomputed encoding
+        positional_encoding = self.pe[:, :seq_len, :]  # (1, seq_len, d_model)
+        # Broadcast across batch dimension
+        return x + positional_encoding.expand(batch_size, -1, -1)
+
 
 
 class SpatialEncoding(nn.Module):
@@ -125,23 +137,15 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
         else:
             self.position_head = nn.Linear(d_model, 2)
 
+    # 4. REPLACE _teacher_forcing_predictions method
     def _teacher_forcing_predictions(self, memory, attention_mask, current_pos_est, 
                                     future_positions_target, location_emb, class_emb, device):
         """
-        Teacher forcing for training
-        
-        Args:
-            memory: Encoded past sequence
-            attention_mask: Mask for past sequence
-            current_pos_est: Current position estimate (batch, 2)
-            future_positions_target: Ground truth future positions (batch, T_future, 2)
-            location_emb, class_emb: Context embeddings
-            device: Device
+        Teacher forcing for training - FIXED to ensure consistent key naming
         """
         batch_size = current_pos_est.size(0)
         
         # Create decoder input sequence: [current_pos, future_pos[0], ..., future_pos[T_future-2]]
-        # We don't include the last future position because we predict it
         decoder_positions = torch.cat([
             current_pos_est.unsqueeze(1),  # (batch, 1, 2)
             future_positions_target[:, :-1, :]  # (batch, T_future-1, 2)
@@ -154,12 +158,14 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
         context_emb = location_emb + class_emb  # (batch, d_model)
         decoder_input = decoder_input + context_emb.unsqueeze(1)  # (batch, T_future, d_model)
         
-        # Add temporal encoding for future timesteps
+        # Add temporal encoding for future timesteps - FIXED indexing and expansion
         for i in range(self.T_future):
             temporal_pos = self.T_past + i
-            if temporal_pos < self.temporal_encoding.pe.size(0):
-                temporal_emb = self.temporal_encoding.pe[temporal_pos]  # (1, d_model)
-                decoder_input[:, i, :] += temporal_emb
+            if temporal_pos < self.temporal_encoding.pe.size(1):  # Note: size(1) not size(0)
+                temporal_emb = self.temporal_encoding.pe[:, temporal_pos, :]  # (1, d_model) - removed extra dimension
+                temporal_emb = temporal_emb.unsqueeze(1)  # (1, 1, d_model)
+                temporal_emb = temporal_emb.expand(batch_size, 1, -1)  # (batch, 1, d_model)
+                decoder_input[:, i:i+1, :] += temporal_emb
         
         # Create causal mask for autoregressive property
         causal_mask = torch.triu(torch.ones(self.T_future, self.T_future, device=device) * float('-inf'), diagonal=1)
@@ -189,8 +195,10 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
                 return {
                     'future_deltas_mu': delta_mu,
                     'future_deltas_logvar': delta_logvar,
+                    'future_deltas': delta_mu,  # Add this for backward compatibility
                     'future_positions_mu': positions,
-                    'future_positions_logvar': future_positions_logvar 
+                    'future_positions_logvar': future_positions_logvar,
+                    'future_positions': positions  # Add this for backward compatibility
                 }
             else:
                 delta_pred = delta_predictions
@@ -208,11 +216,13 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
                 pos_predictions = self.position_head(decoder_output)
                 return {
                     'future_positions_mu': pos_predictions[..., :2],
-                    'future_positions_logvar': pos_predictions[..., 2:]
+                    'future_positions_logvar': pos_predictions[..., 2:],
+                    'future_positions': pos_predictions[..., :2]  # Add for backward compatibility
                 }
             else:
+                positions = self.position_head(decoder_output)
                 return {
-                    'future_positions': self.position_head(decoder_output)
+                    'future_positions': positions
                 }
 
     def _convert_deltas_to_positions_teacher_forcing(self, start_pos, deltas):
@@ -227,7 +237,53 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
 
         return positions
 
-# Modified forward method to use teacher forcing during training
+    # Modified forward method to use teacher forcing during training
+    def _create_enhanced_past_embeddings(self, past_positions, past_positions_orig, 
+                                    obs_mask, location_emb, class_emb, device):
+        """Create enhanced embeddings that include gap information"""
+        batch_size = past_positions.size(0)
+        
+        # Calculate gaps since last observation
+        gaps = torch.zeros_like(obs_mask, dtype=torch.long)
+        for i in range(batch_size):
+            gap_counter = 0
+            for j in range(self.T_past):
+                if obs_mask[i, j] == 1:
+                    gap_counter = 0
+                else:
+                    gap_counter += 1
+                gaps[i, j] = min(gap_counter, self.T_past)  # Cap at T_past
+        
+        # Create position embeddings
+        pos_emb = torch.zeros(batch_size, self.T_past, self.d_model, device=device)
+        
+        for i in range(batch_size):
+            for j in range(self.T_past):
+                if obs_mask[i, j] == 1:
+                    # Observed position
+                    pos_emb[i, j] = self.pos_projection(past_positions[i, j])
+                else:
+                    # Unobserved position - use learned token
+                    pos_emb[i, j] = self.unobserved_token
+        
+        # Add spatial encoding (only for observed positions)
+        spatial_emb = self.spatial_encoding(past_positions_orig)
+        obs_mask_expanded = obs_mask.unsqueeze(-1).expand(-1, -1, self.d_model)
+        pos_emb = pos_emb + spatial_emb * obs_mask_expanded
+        
+        # Add gap encoding
+        gap_emb = self.gap_encoding(gaps)
+        pos_emb = pos_emb + gap_emb
+        
+        # Add location and class embeddings
+        pos_emb = pos_emb + location_emb.unsqueeze(1) + class_emb.unsqueeze(1)
+        
+        # Add temporal encoding - NO TRANSPOSING needed with corrected PositionalEncoding
+        pos_emb = self.temporal_encoding(pos_emb)
+        
+        return pos_emb
+
+    # 3. REPLACE forward method
     def forward(self, batch, use_teacher_forcing=True):
         batch_size = batch['past_positions'].size(0)
         device = batch['past_positions'].device
@@ -252,69 +308,36 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
         # Estimate current position
         current_pos_est = self._estimate_current_position(memory, obs_mask, past_positions)
         
-        # Use teacher forcing during training, autoregressive during inference
+        # Generate predictions
         if use_teacher_forcing and self.training:
             future_predictions = self._teacher_forcing_predictions(
                 memory, attention_mask, current_pos_est, 
                 batch['future_positions'], location_emb, class_emb, device
             )
+            # Teacher forcing already returns correctly formatted outputs
+            outputs = future_predictions
         else:
             future_predictions = self._generate_autoregressive_predictions(
                 memory, attention_mask, current_pos_est, location_emb, class_emb, device
             )
-        
-        # Process outputs
-        if use_teacher_forcing and self.training:
-            outputs = future_predictions  # Already in correct format
-        else:
+            # Process autoregressive outputs to match teacher forcing format
             outputs = self._process_autoregressive_outputs(future_predictions, current_pos_est)
         
+        # Add current position estimate to outputs
         outputs['current_position_estimate'] = current_pos_est
+        
+        # IMPORTANT: Ensure consistent key naming for training compatibility
+        if self.use_deltas:
+            if self.predict_uncertainty:
+                # Make sure both 'future_deltas' and uncertainty keys exist
+                if 'future_deltas_mu' in outputs:
+                    outputs['future_deltas'] = outputs['future_deltas_mu']  # For backward compatibility
+            else:
+                # Ensure 'future_deltas' key exists
+                if 'future_deltas' not in outputs:
+                    print(f"Warning: 'future_deltas' key missing. Available keys: {list(outputs.keys())}")
+        
         return outputs
-    
-    def _create_enhanced_past_embeddings(self, past_positions, past_positions_orig, 
-                                       obs_mask, location_emb, class_emb, device):
-        """Create enhanced embeddings that include gap information"""
-        batch_size = past_positions.size(0)
-        
-
-        gaps = torch.zeros_like(obs_mask, dtype=torch.long)
-        for i in range(batch_size):
-            gap_counter = 0
-            for j in range(self.T_past):
-                if obs_mask[i, j] == 1:
-                    gap_counter = 0
-                else:
-                    gap_counter += 1
-                gaps[i, j] = min(gap_counter, self.T_past)  # Cap at T_past
-        
-
-        pos_emb = torch.zeros(batch_size, self.T_past, self.d_model, device=device)
-        
-        for i in range(batch_size):
-            for j in range(self.T_past):
-                if obs_mask[i, j] == 1:
-
-                    pos_emb[i, j] = self.pos_projection(past_positions[i, j])
-                else:
-                    # Unobserved position - use learned token
-                    pos_emb[i, j] = self.unobserved_token
-        
-
-        spatial_emb = self.spatial_encoding(past_positions_orig)
-        obs_mask_expanded = obs_mask.unsqueeze(-1).expand(-1, -1, self.d_model)
-        pos_emb = pos_emb + spatial_emb * obs_mask_expanded
-
-        gap_emb = self.gap_encoding(gaps)
-        pos_emb = pos_emb + gap_emb
-        
-
-        pos_emb = pos_emb + location_emb.unsqueeze(1) + class_emb.unsqueeze(1)
-        
-
-        pos_emb = self.temporal_encoding(pos_emb.transpose(0, 1)).transpose(0, 1)
-        
-        return pos_emb
     
     def _estimate_current_position(self, memory, obs_mask, past_positions):
         """Estimate current position using all available information"""
@@ -345,8 +368,9 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
         return decoder_input
     
         
+    # 5. REPLACE _generate_autoregressive_predictions method
     def _generate_autoregressive_predictions(self, memory, attention_mask, 
-                                        current_pos_est, location_emb, class_emb, device):
+                                    current_pos_est, location_emb, class_emb, device):
         """Generate future predictions autoregressively"""
         batch_size = current_pos_est.size(0)
         
@@ -363,22 +387,22 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
         
         for t in range(self.T_future):
             # Prepare decoder input for current timestep
-            # Project current position to embedding space
             decoder_input = self.pos_projection(current_pos)  # (batch_size, d_model)
             decoder_input = decoder_input.unsqueeze(1)  # (batch_size, 1, d_model)
             
             # Add context embeddings
             decoder_input = decoder_input + context_emb.unsqueeze(1)  # (batch_size, 1, d_model)
             
-            # Add temporal encoding for current future timestep
+            # Add temporal encoding for current future timestep - FIXED indexing and expansion
             temporal_pos = self.T_past + t
-            if temporal_pos < self.temporal_encoding.pe.size(0):
-                # Get temporal embedding - handle the positional encoding correctly
-                temporal_emb = self.temporal_encoding.pe[temporal_pos:temporal_pos+1]  # (1, d_model)
-                temporal_emb = temporal_emb.unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, 1, d_model)
+            if temporal_pos < self.temporal_encoding.pe.size(1):  # Note: size(1) not size(0)
+                # Get temporal embedding with correct indexing
+                temporal_emb = self.temporal_encoding.pe[:, temporal_pos, :]  # (1, d_model) - removed extra dimension
+                temporal_emb = temporal_emb.unsqueeze(1)  # (1, 1, d_model)
+                temporal_emb = temporal_emb.expand(batch_size, 1, -1)  # (batch_size, 1, d_model)
                 decoder_input = decoder_input + temporal_emb
             
-            # Apply transformer decoder - NO TRANSPOSING needed since batch_first=True
+            # Apply transformer decoder
             decoder_output = self.transformer_decoder(
                 tgt=decoder_input,  # (batch_size, 1, d_model)
                 memory=memory,      # (batch_size, T_past, d_model)
@@ -427,7 +451,7 @@ class LandscapeAwareTrajectoryPredictor(nn.Module):
             'deltas': future_deltas,
             'uncertainties': future_uncertainties
         }
-    
+        
     def _process_autoregressive_outputs(self, predictions, current_pos_est):
         """Process autoregressive predictions into final output format"""
         outputs = {}
