@@ -1124,6 +1124,7 @@ def evaluate_model(model, dataloader, criterion, device, dataset=None):
 def debug_model_forward(model, batch, device):
     """Debug the model forward pass to find where CUDA indexing fails"""
     print("Debugging model forward pass...")
+    classes = ['Pedestrian', 'Biker', 'Skater', 'Cart', 'Car', 'Bus']
     
     # Move batch to device
     for key, value in batch.items():
@@ -1173,10 +1174,10 @@ def debug_model_forward(model, batch, device):
                     # Check if any labels are out of bounds
                     invalid_labels = labels[(labels < -1) | (labels >= len(classes))]
                     if len(invalid_labels) > 0:
-                        print(f"  ❌ FOUND INVALID LABELS: {invalid_labels.unique()}")
+                        print(f"   FOUND INVALID LABELS: {invalid_labels.unique()}")
                         print(f"  This is likely the cause of the indexing error!")
                     else:
-                        print(f"  ✓ All agent labels are within bounds")
+                        print(f"   All agent labels are within bounds")
                 
                 if 'location' in batch and isinstance(batch['location'], list):
                     print(f"\nLocation analysis:")
@@ -1187,9 +1188,9 @@ def debug_model_forward(model, batch, device):
                     # Check if all locations are in the expected list
                     invalid_locs = unique_locs - set(locations)
                     if invalid_locs:
-                        print(f"  ❌ FOUND INVALID LOCATIONS: {invalid_locs}")
+                        print(f"   FOUND INVALID LOCATIONS: {invalid_locs}")
                     else:
-                        print(f"  ✓ All locations are valid")
+                        print(f"   All locations are valid")
             
             raise e
 
@@ -1245,7 +1246,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
             
         except RuntimeError as e:
             if "indexSelectLargeIndex" in str(e):
-                print(f"\n❌ CUDA indexing error at batch {batch_idx}")
+                print(f"\n CUDA indexing error at batch {batch_idx}")
                 print("This suggests an out-of-bounds index in an embedding lookup or attention operation")
                 print("Most likely causes:")
                 print("1. agent_labels contains indices >= num_classes")
