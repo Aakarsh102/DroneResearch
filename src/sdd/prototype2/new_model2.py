@@ -1,3 +1,4 @@
+
 # import torch
 # import torch.nn as nn
 # import math
@@ -80,22 +81,6 @@
 #             current_x = layer(current_x, src_key_padding_mask=attention_mask)
             
 #         return current_x
-
-# class AlternatingTransformerLayer(nn.Module):
-#     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
-#         super(AlternatingTransformerLayer, self).__init__()
-#         self.temporal_layer = nn.TransformerEncoderLayer(
-#             d_model, nhead, dim_feedforward, dropout, batch_first=True
-#         )
-#         self.agent_layer = nn.TransformerEncoderLayer(
-#             d_model, nhead, dim_feedforward, dropout, batch_first=True
-#         )
-        
-#     def forward(self, x, layer_idx, attention_mask=None):
-#         if layer_idx % 2 == 0:
-#             return self.temporal_layer(x, src_key_padding_mask=attention_mask)
-#         else:
-#             return self.agent_layer(x, src_key_padding_mask=attention_mask)
 
 # class AlternatingTransformerDecoder(nn.Module):
 #     def __init__(self, d_model, nhead, num_layers, dim_feedforward, dropout=0.1):
@@ -194,17 +179,18 @@
 #         self.T_future = T_future
 #         self.num_classes = num_classes
 #         self.max_agents = max_agents
+#         self.locations = locations
+#         self.location_to_idx = {loc:i for i,loc in enumerate(locations)}
 
-#         # Embeddings
-#         self.location_embedding = nn.Embedding(len(locations), d_model)
-#         self.location_to_idx = {loc: i for i, loc in enumerate(locations)}
+
+#         # Embeddings (NO location embedding as requested)
 #         self.class_embedding = nn.Embedding(num_classes, d_model)
 #         self.agent_embedding = nn.Embedding(max_agents, d_model)
+#         self.location_embedding = nn.Embedding(len(locations), d_model)
         
 #         # Encodings
 #         self.spatial_encoding = SpatialEncoding(d_model)
 #         self.temporal_encoding = PositionalEncoding(d_model)
-#         self.location_embedding = nn.Embedding(len(locations), d_model)
         
 #         # Projections
 #         self.pos_projection = nn.Linear(2, d_model)
@@ -250,9 +236,9 @@
 #                     gaps[b, n, t] = min(gap_counter, self.T_past)
         
 #         # Create position embeddings
-#         location_emb = location_emb.expand(-1, -1, seq_len, -1)
 #         pos_emb = torch.zeros(batch_size, num_agents, seq_len, self.d_model, device=device)
-        
+#         location_expanded = location_emb.unsqueeze(1).unsqueeze(2).expand(-1, num_agents, seq_len, -1)
+
 #         # Use broadcasting for efficiency
 #         observed_mask = obs_mask.unsqueeze(-1).expand(-1, -1, -1, self.d_model)
         
@@ -271,14 +257,11 @@
 #         gap_emb = self.gap_encoding(gaps)
 #         pos_emb = pos_emb + gap_emb
         
-#         # Add context embeddings with proper broadcasting
-#         #location_expanded = location_emb.unsqueeze(1).unsqueeze(2).expand(-1, num_agents, seq_len, -1)
-#         #FIX: won't there be a mismatch in dimensions here?
+#         # Add context embeddings with proper broadcasting (NO location embedding)
 #         class_expanded = class_emb.unsqueeze(2).expand(-1, -1, seq_len, -1)
 #         agent_expanded = agent_emb.unsqueeze(2).expand(-1, -1, seq_len, -1)
         
-#         #pos_emb = pos_emb + location_expanded + class_expanded + agent_expanded
-#         pos_emb = pos_emb + class_expanded + agent_expanded
+#         pos_emb = pos_emb + class_expanded + agent_expanded + location_expanded
         
 #         # Reshape for transformer: (B, N, T, d_model) -> (B*N, T, d_model)
 #         pos_emb = pos_emb.view(batch_size * num_agents, seq_len, self.d_model)
@@ -304,7 +287,7 @@
 #         # Project to embedding space
 #         decoder_input = self.pos_projection(decoder_positions)  # (B*N, T_future, d_model)
         
-#         # Add context embeddings
+#         # Add context embeddings (NO location embedding)
 #         location_flat = location_emb.unsqueeze(1).expand(batch_size, num_agents, -1).contiguous()
 #         location_flat = location_flat.view(batch_size * num_agents, self.d_model)
 #         class_flat = class_emb.view(batch_size * num_agents, self.d_model)
@@ -405,25 +388,24 @@
 #         """Main forward pass"""
 #         batch_size, num_agents = batch['past_positions'].shape[:2]
 #         device = batch['past_positions'].device
-        
-#         # Get embeddings
 #         location_indices = torch.tensor([self.location_to_idx[loc] for loc in batch['location']], 
-#                                       device=device)
-#         location_emb = self.location_embedding(location_indices)
-#         #FIX: shouldn't it be agent_labels?
-#         class_emb = self.class_embedding(batch['label'])
+#                                        device=device)
+        
+#         # Get embeddings (NO location embedding)
+#         class_emb = self.class_embedding(batch['agent_labels'])
         
 #         agent_ids = torch.arange(num_agents, device=device).unsqueeze(0).expand(batch_size, -1)
 #         agent_emb = self.agent_embedding(agent_ids)
+#         location_emb = self.location_embedding(location_indices)
         
 #         # Create past embeddings
 #         past_emb = self._create_enhanced_past_embeddings(
-#             batch['past_positions'], batch['past_positions_orig'], batch['obs_mask'],
-#             location_emb, class_emb, agent_emb, device
+#             batch['past_positions'], batch['past_positions_orig'], batch['obs_masks'], location_emb,
+#             class_emb, agent_emb, device
 #         )
         
 #         # Create attention mask
-#         obs_mask_flat = batch['obs_mask'].view(batch_size * num_agents, self.T_past)
+#         obs_mask_flat = batch['obs_masks'].view(batch_size * num_agents, self.T_past)
 #         attention_mask = (obs_mask_flat == 0)  # True where padded
         
 #         # Encode - now temporal-only
@@ -431,18 +413,18 @@
         
 #         # Estimate current positions
 #         current_pos_est = self._estimate_current_position(
-#             memory, batch['obs_mask'], batch['past_positions']
+#             memory, batch['obs_masks'], batch['past_positions']
 #         )
         
 #         # Generate future predictions
 #         if use_teacher_forcing and self.training:
 #             predictions = self._teacher_forcing_predictions(
 #                 memory, attention_mask, current_pos_est, batch['future_positions'],
-#                 location_emb, class_emb, agent_emb, batch_size, num_agents, device
+#                 class_emb, agent_emb, batch_size, num_agents, device
 #             )
 #         else:
 #             predictions = self._generate_autoregressive_predictions(
-#                 memory, attention_mask, current_pos_est, location_emb, class_emb, 
+#                 memory, attention_mask, current_pos_est, class_emb, 
 #                 agent_emb, batch_size, num_agents, device
 #             )
         
@@ -450,17 +432,15 @@
 #         return predictions
 
 #     def _generate_autoregressive_predictions(self, memory, attention_mask, current_pos_est,
-#                                            location_emb, class_emb, agent_emb, 
+#                                            class_emb, agent_emb, 
 #                                            batch_size, num_agents, device):
 #         """Generate predictions autoregressively with modified output heads"""
 #         current_pos = current_pos_est.view(batch_size * num_agents, 2)
         
-#         # Context embeddings
-#         location_flat = location_emb.unsqueeze(1).expand(batch_size, num_agents, -1).contiguous()
-#         location_flat = location_flat.view(batch_size * num_agents, self.d_model)
+#         # Context embeddings (NO location embedding)
 #         class_flat = class_emb.view(batch_size * num_agents, self.d_model)
 #         agent_flat = agent_emb.view(batch_size * num_agents, self.d_model)
-#         context_emb = location_flat + class_flat + agent_flat
+#         context_emb = class_flat + agent_flat
         
 #         # Storage for predictions
 #         future_deltas_mu = []
@@ -547,7 +527,8 @@
 #         pred_var = None
     
 #     target_pos = targets['future_positions']  # (B, N, T_future, 2)
-#     valid_mask = targets.get('occ_mask', torch.ones_like(target_pos[..., 0]))  # (B, N, T_future)
+#     # Use correct mask names from dataset
+#     valid_mask = targets.get('temporal_masks_future', torch.ones_like(target_pos[..., 0]))  # (B, N, T_future)
     
 #     # Denormalize if needed
 #     if video_stats is not None:
@@ -615,6 +596,7 @@
 #         metrics['Avg_LogVar'] = avg_logvar.item()
     
 #     return metrics
+
 
 import torch
 import torch.nn as nn
@@ -799,10 +781,8 @@ class GraphInteractionModel(nn.Module):
         self.locations = locations
         self.location_to_idx = {loc:i for i,loc in enumerate(locations)}
 
-
-        # Embeddings (NO location embedding as requested)
+        # Embeddings (NO agent embedding)
         self.class_embedding = nn.Embedding(num_classes, d_model)
-        self.agent_embedding = nn.Embedding(max_agents, d_model)
         self.location_embedding = nn.Embedding(len(locations), d_model)
         
         # Encodings
@@ -836,7 +816,7 @@ class GraphInteractionModel(nn.Module):
         )
 
     def _create_enhanced_past_embeddings(self, past_positions, past_positions_orig, obs_mask,
-                                       location_emb, class_emb, agent_emb, device):
+                                       location_emb, class_emb, device):
         """Create enhanced embeddings for past trajectory"""
         batch_size, num_agents, seq_len, _ = past_positions.shape
         
@@ -874,11 +854,10 @@ class GraphInteractionModel(nn.Module):
         gap_emb = self.gap_encoding(gaps)
         pos_emb = pos_emb + gap_emb
         
-        # Add context embeddings with proper broadcasting (NO location embedding)
+        # Add context embeddings (NO agent embedding)
         class_expanded = class_emb.unsqueeze(2).expand(-1, -1, seq_len, -1)
-        agent_expanded = agent_emb.unsqueeze(2).expand(-1, -1, seq_len, -1)
         
-        pos_emb = pos_emb + class_expanded + agent_expanded + location_expanded
+        pos_emb = pos_emb + class_expanded + location_expanded
         
         # Reshape for transformer: (B, N, T, d_model) -> (B*N, T, d_model)
         pos_emb = pos_emb.view(batch_size * num_agents, seq_len, self.d_model)
@@ -889,7 +868,7 @@ class GraphInteractionModel(nn.Module):
         return pos_emb
 
     def _teacher_forcing_predictions(self, memory, attention_mask, current_pos_est,
-                                   future_positions_target, location_emb, class_emb, agent_emb,
+                                   future_positions_target, location_emb, class_emb,
                                    batch_size, num_agents, device):
         """Teacher forcing for training with modified output heads"""
         current_pos_flat = current_pos_est.view(batch_size * num_agents, 2)
@@ -904,13 +883,12 @@ class GraphInteractionModel(nn.Module):
         # Project to embedding space
         decoder_input = self.pos_projection(decoder_positions)  # (B*N, T_future, d_model)
         
-        # Add context embeddings (NO location embedding)
+        # Add context embeddings (NO agent embedding)
         location_flat = location_emb.unsqueeze(1).expand(batch_size, num_agents, -1).contiguous()
         location_flat = location_flat.view(batch_size * num_agents, self.d_model)
         class_flat = class_emb.view(batch_size * num_agents, self.d_model)
-        agent_flat = agent_emb.view(batch_size * num_agents, self.d_model)
         
-        context_emb = location_flat + class_flat + agent_flat  # (B*N, d_model)
+        context_emb = location_flat + class_flat  # (B*N, d_model)
         decoder_input = decoder_input + context_emb.unsqueeze(1)
         
         # Create temporal encoding for future steps
@@ -1008,17 +986,14 @@ class GraphInteractionModel(nn.Module):
         location_indices = torch.tensor([self.location_to_idx[loc] for loc in batch['location']], 
                                        device=device)
         
-        # Get embeddings (NO location embedding)
+        # Get embeddings (NO agent embedding)
         class_emb = self.class_embedding(batch['agent_labels'])
-        
-        agent_ids = torch.arange(num_agents, device=device).unsqueeze(0).expand(batch_size, -1)
-        agent_emb = self.agent_embedding(agent_ids)
         location_emb = self.location_embedding(location_indices)
         
         # Create past embeddings
         past_emb = self._create_enhanced_past_embeddings(
             batch['past_positions'], batch['past_positions_orig'], batch['obs_masks'], location_emb,
-            class_emb, agent_emb, device
+            class_emb, device
         )
         
         # Create attention mask
@@ -1037,27 +1012,28 @@ class GraphInteractionModel(nn.Module):
         if use_teacher_forcing and self.training:
             predictions = self._teacher_forcing_predictions(
                 memory, attention_mask, current_pos_est, batch['future_positions'],
-                class_emb, agent_emb, batch_size, num_agents, device
+                location_emb, class_emb, batch_size, num_agents, device
             )
         else:
             predictions = self._generate_autoregressive_predictions(
                 memory, attention_mask, current_pos_est, class_emb, 
-                agent_emb, batch_size, num_agents, device
+                location_emb, batch_size, num_agents, device
             )
         
         predictions['current_position_estimate'] = current_pos_est
         return predictions
 
     def _generate_autoregressive_predictions(self, memory, attention_mask, current_pos_est,
-                                           class_emb, agent_emb, 
+                                           class_emb, location_emb, 
                                            batch_size, num_agents, device):
         """Generate predictions autoregressively with modified output heads"""
         current_pos = current_pos_est.view(batch_size * num_agents, 2)
         
-        # Context embeddings (NO location embedding)
+        # Context embeddings (NO agent embedding)
         class_flat = class_emb.view(batch_size * num_agents, self.d_model)
-        agent_flat = agent_emb.view(batch_size * num_agents, self.d_model)
-        context_emb = class_flat + agent_flat
+        location_flat = location_emb.unsqueeze(1).expand(batch_size, num_agents, -1).contiguous()
+        location_flat = location_flat.view(batch_size * num_agents, self.d_model)
+        context_emb = class_flat + location_flat
         
         # Storage for predictions
         future_deltas_mu = []
@@ -1129,87 +1105,3 @@ def denormalize_positions(normalized_coords, video_stats):
         return normalized_coords * std + mean
     else:
         return normalized_coords * video_stats['std'] + video_stats['mean']
-
-
-def compute_multi_agent_metrics(predictions, targets, video_stats=None):
-    """Compute evaluation metrics for multi-agent trajectories"""
-    metrics = {}
-    
-    # Get predictions and targets
-    if 'future_positions_mu' in predictions:
-        pred_pos = predictions['future_positions_mu']  # (B, N, T_future, 2)
-        pred_var = predictions['future_positions_var']  # (B, N, T_future, 2)
-    else:
-        pred_pos = predictions['future_positions']
-        pred_var = None
-    
-    target_pos = targets['future_positions']  # (B, N, T_future, 2)
-    # Use correct mask names from dataset
-    valid_mask = targets.get('temporal_masks_future', torch.ones_like(target_pos[..., 0]))  # (B, N, T_future)
-    
-    # Denormalize if needed
-    if video_stats is not None:
-        pred_pos = denormalize_positions(pred_pos, video_stats)
-        target_pos = denormalize_positions(target_pos, video_stats)
-    
-    # Compute ADE (Average Displacement Error) across all agents
-    displacement = torch.norm(pred_pos - target_pos, dim=-1)  # (B, N, T_future)
-    masked_displacement = displacement * valid_mask
-    ade = masked_displacement.sum() / valid_mask.sum()
-    metrics['ADE'] = ade.item()
-    
-    # Compute FDE (Final Displacement Error) across all agents
-    final_displacement = displacement[..., -1]  # (B, N)
-    final_valid = valid_mask[..., -1]  # (B, N)
-    fde = (final_displacement * final_valid).sum() / final_valid.sum()
-    metrics['FDE'] = fde.item()
-    
-    # Per-agent metrics
-    batch_size, num_agents = pred_pos.shape[:2]
-    agent_ades = []
-    agent_fdes = []
-    
-    for n in range(num_agents):
-        agent_disp = displacement[:, n, :]  # (B, T_future)
-        agent_mask = valid_mask[:, n, :]  # (B, T_future)
-        
-        if agent_mask.sum() > 0:
-            agent_ade = (agent_disp * agent_mask).sum() / agent_mask.sum()
-            agent_ades.append(agent_ade.item())
-            
-            agent_final_disp = agent_disp[:, -1]  # (B,)
-            agent_final_mask = agent_mask[:, -1]  # (B,)
-            if agent_final_mask.sum() > 0:
-                agent_fde = (agent_final_disp * agent_final_mask).sum() / agent_final_mask.sum()
-                agent_fdes.append(agent_fde.item())
-    
-    if agent_ades:
-        metrics['Agent_ADE_Mean'] = sum(agent_ades) / len(agent_ades)
-        metrics['Agent_ADE_Std'] = torch.tensor(agent_ades).std().item()
-    
-    if agent_fdes:
-        metrics['Agent_FDE_Mean'] = sum(agent_fdes) / len(agent_fdes)
-        metrics['Agent_FDE_Std'] = torch.tensor(agent_fdes).std().item()
-    
-    # Uncertainty calibration metrics (modified for log variance)
-    if pred_var is not None:
-        # Prediction interval coverage (95% confidence)
-        std = torch.sqrt(pred_var)
-        lower_bound = pred_pos - 1.96 * std
-        upper_bound = pred_pos + 1.96 * std
-        
-        within_interval = ((target_pos >= lower_bound) & (target_pos <= upper_bound)).float()
-        coverage = (within_interval * valid_mask.unsqueeze(-1)).sum() / valid_mask.sum()
-        metrics['Coverage_95'] = coverage.item()
-        
-        # Average uncertainty
-        avg_uncertainty = (pred_var * valid_mask.unsqueeze(-1)).sum() / valid_mask.sum()
-        metrics['Avg_Uncertainty'] = avg_uncertainty.item()
-    
-    # If we have log variance predictions, add log variance specific metrics
-    if 'future_deltas_logvar' in predictions:
-        logvar = predictions['future_deltas_logvar']  # (B, N, T_future, 2)
-        avg_logvar = (logvar * valid_mask.unsqueeze(-1)).sum() / valid_mask.sum()
-        metrics['Avg_LogVar'] = avg_logvar.item()
-    
-    return metrics
