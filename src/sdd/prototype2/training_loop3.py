@@ -1125,6 +1125,7 @@ def debug_model_forward(model, batch, device):
     """Debug the model forward pass to find where CUDA indexing fails"""
     print("Debugging model forward pass...")
     classes = ['Pedestrian', 'Biker', 'Skater', 'Cart', 'Car', 'Bus']
+    locations = ['bookstore', 'coupa', 'deathCircle', 'gates', 'hyang', 'nexus', 'quad']
     
     # Move batch to device
     for key, value in batch.items():
@@ -1145,7 +1146,7 @@ def debug_model_forward(model, batch, device):
     
     # Try to identify which part of the model fails
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         try:
             print("\nTesting model forward pass...")
             predictions = model(batch, use_teacher_forcing=False)
