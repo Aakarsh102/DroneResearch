@@ -23,3 +23,5 @@ src/sdd/prototype1/models/
 src/sdd/prototype2/models/
 srd/sdd/__pycache__/
 dataset_cache/
+new_cache_16/
+alternateing_model_vis/
