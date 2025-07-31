@@ -17,7 +17,7 @@ from functools import lru_cache
 import h5py
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from model2 import GraphInteractionModel
+from sdd.prototype2.model2_both_alternate import GraphInteractionModel
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import wandb

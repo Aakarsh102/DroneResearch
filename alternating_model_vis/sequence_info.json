@@ -1,0 +1,126 @@
+[
+  {
+    "location": "nexus",
+    "video": "video9",
+    "num_agents": 3,
+    "agent_ids": [
+      8,
+      62,
+      63
+    ],
+    "agent_classes": [
+      "Pedestrian",
+      "Pedestrian",
+      "Pedestrian"
+    ]
+  },
+  {
+    "location": "coupa",
+    "video": "video1",
+    "num_agents": 1,
+    "agent_ids": [
+      30
+    ],
+    "agent_classes": [
+      "Pedestrian"
+    ]
+  },
+  {
+    "location": "nexus",
+    "video": "video7",
+    "num_agents": 3,
+    "agent_ids": [
+      9,
+      57,
+      58
+    ],
+    "agent_classes": [
+      "Pedestrian",
+      "Biker",
+      "Pedestrian"
+    ]
+  },
+  {
+    "location": "deathCircle",
+    "video": "video0",
+    "num_agents": 2,
+    "agent_ids": [
+      20,
+      21
+    ],
+    "agent_classes": [
+      "Biker",
+      "Biker"
+    ]
+  },
+  {
+    "location": "nexus",
+    "video": "video11",
+    "num_agents": 8,
+    "agent_ids": [
+      0,
+      1,
+      2,
+      52,
+      53,
+      54,
+      55,
+      56
+    ],
+    "agent_classes": [
+      "Car",
+      "Car",
+      "Car",
+      "Car",
+      "Car",
+      "Car",
+      "Car",
+      "Car"
+    ]
+  },
+  {
+    "location": "deathCircle",
+    "video": "video0",
+    "num_agents": 3,
+    "agent_ids": [
+      222,
+      308,
+      310
+    ],
+    "agent_classes": [
+      "Pedestrian",
+      "Biker",
+      "Biker"
+    ]
+  },
+  {
+    "location": "little",
+    "video": "video1",
+    "num_agents": 1,
+    "agent_ids": [
+      56
+    ],
+    "agent_classes": [
+      "Biker"
+    ]
+  },
+  {
+    "location": "deathCircle",
+    "video": "video1",
+    "num_agents": 5,
+    "agent_ids": [
+      815,
+      947,
+      956,
+      978,
+      979
+    ],
+    "agent_classes": [
+      "Biker",
+      "Biker",
+      "Biker",
+      "Biker",
+      "Biker"
+    ]
+  }
+]
