@@ -1,0 +1,116 @@
+[
+  {
+    "location": "gates",
+    "video": "video0",
+    "num_agents": 2,
+    "agent_ids": [
+      64,
+      111
+    ],
+    "agent_classes": [
+      "Pedestrian",
+      "Biker"
+    ]
+  },
+  {
+    "location": "bookstore",
+    "video": "video6",
+    "num_agents": 3,
+    "agent_ids": [
+      109,
+      110,
+      112
+    ],
+    "agent_classes": [
+      "Pedestrian",
+      "Pedestrian",
+      "Skater"
+    ]
+  },
+  {
+    "location": "little",
+    "video": "video3",
+    "num_agents": 2,
+    "agent_ids": [
+      177,
+      212
+    ],
+    "agent_classes": [
+      "Biker",
+      "Pedestrian"
+    ]
+  },
+  {
+    "location": "coupa",
+    "video": "video3",
+    "num_agents": 3,
+    "agent_ids": [
+      51,
+      85,
+      86
+    ],
+    "agent_classes": [
+      "Pedestrian",
+      "Pedestrian",
+      "Pedestrian"
+    ]
+  },
+  {
+    "location": "little",
+    "video": "video1",
+    "num_agents": 1,
+    "agent_ids": [
+      28
+    ],
+    "agent_classes": [
+      "Biker"
+    ]
+  },
+  {
+    "location": "deathCircle",
+    "video": "video3",
+    "num_agents": 6,
+    "agent_ids": [
+      289,
+      519,
+      520,
+      531,
+      545,
+      807
+    ],
+    "agent_classes": [
+      "Pedestrian",
+      "Cart",
+      "Cart",
+      "Pedestrian",
+      "Biker",
+      "Biker"
+    ]
+  },
+  {
+    "location": "bookstore",
+    "video": "video1",
+    "num_agents": 2,
+    "agent_ids": [
+      57,
+      263
+    ],
+    "agent_classes": [
+      "Pedestrian",
+      "Pedestrian"
+    ]
+  },
+  {
+    "location": "bookstore",
+    "video": "video6",
+    "num_agents": 2,
+    "agent_ids": [
+      29,
+      30
+    ],
+    "agent_classes": [
+      "Biker",
+      "Pedestrian"
+    ]
+  }
+]

@@ -279,7 +279,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                  T_past=10, T_future=10, use_deltas=True, normalize_positions=True,
                  cache_dir="dataset_cache", lazy_loading=True, num_workers=4,
                  max_agents=20, min_frames_per_agent=2, pad_value=-999.0,
-                 frame_subsample=12):  # NEW: Frame subsampling parameter
+                 frame_subsample=12):
         self.drone_data_root = drone_data_root
         self.orig_root = original_dataset_root
         self.classes = classes
@@ -292,9 +292,9 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         self.num_workers = num_workers
         self.max_agents = max_agents
         self.min_frames_per_agent = self.T_past
-        self.pad_value = pad_value  # Value used for padding missing agents/frames
-        self.frame_subsample = frame_subsample  # NEW: Subsample every Nth frame
-        self.obs_sets = None  # Will be populated during dataset building
+        self.pad_value = pad_value
+        self.frame_subsample = frame_subsample
+        self.obs_sets = None
 
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok = True)
@@ -314,7 +314,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                 return None
         return self._hdf5_file_cache.file
     
-    @lru_cache(maxsize=1024)  # Increased cache size significantly
+    @lru_cache(maxsize=1024)
     def _load_trajectory_data_batch(self, video_key: str, track_ids_tuple: tuple):
         """Load multiple trajectory data at once for better I/O efficiency"""
         hdf5_file = self._get_hdf5_file()
@@ -335,6 +335,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                 track_grp = video_grp[str(track_id)]
                 batch_data[track_id] = {
                     'coords': track_grp['coords'][:].astype(np.float32),
+                    'coords_orig': track_grp['coords_orig'][:].astype(np.float32),  # Store original coords too
                     'frames': track_grp['frames'][:].astype(np.int32),
                     'occluded': track_grp['occluded'][:].astype(np.float32),
                     'labels': [label.decode('utf-8') for label in track_grp['labels'][:]]
@@ -357,7 +358,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             'classes': sorted(self.classes),
             'max_agents': self.max_agents,
             'min_frames_per_agent': self.min_frames_per_agent,
-            'frame_subsample': self.frame_subsample  # NEW: Include in cache signature
+            'frame_subsample': self.frame_subsample
         }
         
         if cache_info_file.exists():
@@ -382,9 +383,8 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         with open(cache_info_file, 'w') as f:
             json.dump(cache_info, f)
 
-        
     def _load_from_cache(self, cache_info):
-        # FIXED: Always load obs_sets when loading from cache
+        # Always load obs_sets when loading from cache
         obs_sets_file = self.cache_dir / "obs_sets.pkl"
         if obs_sets_file.exists():
             with open(obs_sets_file, 'rb') as f:
@@ -401,10 +401,13 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             with open(indices_file, 'rb') as f:
                 self.sample_indices = pkl.load(f)
 
+            # Load video stats only if normalization was used (for denormalization purposes)
             if self.normalize_positions:
-                stats_file = self.cache_dir / "video_stats.pkl"  # Fixed typo
+                stats_file = self.cache_dir / "video_stats.pkl"
                 with open(stats_file, "rb") as f:
                     self.video_stats = pkl.load(f)
+            else:
+                self.video_stats = None
         else:
             samples_file = self.cache_dir / "all_samples.pkl"
             with open(samples_file, 'rb') as f:
@@ -454,8 +457,22 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         
         return all_indices
 
+    def _normalize_coordinates_before_storage(self, coords, video_key):
+        """Normalize coordinates using video-specific statistics"""
+        if not self.normalize_positions or self.video_stats is None:
+            return coords
+        
+        if video_key not in self.video_stats:
+            return coords
+            
+        stats = self.video_stats[video_key]
+        mean = stats['mean']
+        std = stats['std'] + 1e-8  # Add small epsilon for numerical stability
+        
+        return (coords - mean) / std
+
     def _save_samples_to_hdf5(self):
-        """Save processed multi-agent trajectory data to HDF5"""
+        """Save processed multi-agent trajectory data to HDF5 with pre-normalized coordinates"""
         hdf5_file = self.cache_dir / "multi_agent_trajectory_data.h5"
         
         # Group samples by video for efficient storage
@@ -482,6 +499,10 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                                names=['trackId','xmin','ymin','xmax','ymax',
                                      'frame','lost','occluded','generated','label'])
                 df = df[df['label'].isin(self.classes)]
+                
+                if len(df) == 0:
+                    continue
+                    
                 df['x'] = (df['xmin'] + df['xmax']) * 0.5
                 df['y'] = (df['ymin'] + df['ymax']) * 0.5
                 
@@ -492,8 +513,14 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                 track_data = {}
                 for tid, grp in df.groupby('trackId'):
                     grp = grp.sort_values('frame').reset_index(drop=True)
+                    coords_orig = grp[['x', 'y']].values.astype(np.float32)
+                    
+                    # NORMALIZE BEFORE STORAGE - this is the key optimization!
+                    coords_normalized = self._normalize_coordinates_before_storage(coords_orig, video_key)
+                    
                     track_data[tid] = {
-                        'coords': grp[['x', 'y']].values.astype(np.float32),
+                        'coords': coords_normalized.astype(np.float32),  # Normalized coordinates
+                        'coords_orig': coords_orig,  # Original coordinates for denormalization if needed
                         'frames': grp['frame'].values.astype(np.int32),
                         'occluded': grp['occluded'].values.astype(np.float32),
                         'labels': grp['label'].values
@@ -503,18 +530,19 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                 for tid, data in track_data.items():
                     track_grp = video_grp.create_group(str(tid))
                     track_grp.create_dataset('coords', data=data['coords'])
+                    track_grp.create_dataset('coords_orig', data=data['coords_orig'])
                     track_grp.create_dataset('frames', data=data['frames'])
                     track_grp.create_dataset('occluded', data=data['occluded'])
                     track_grp.create_dataset('labels', data=data['labels'].astype('S10'))
         
-        # Cache sample indices and stats
+        # Cache sample indices and other data
         with open(self.cache_dir / "sample_indices.pkl", 'wb') as f:
             pkl.dump(self.sample_indices, f)
         
-        # FIXED: Always save obs_sets when building from scratch
         with open(self.cache_dir / "obs_sets.pkl", 'wb') as f:
             pkl.dump(self.obs_sets, f)
         
+        # Save stats for potential denormalization needs
         if self.video_stats:
             with open(self.cache_dir / "video_stats.pkl", 'wb') as f:
                 pkl.dump(self.video_stats, f)
@@ -554,7 +582,6 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         with open(self.cache_dir / "all_samples.pkl", 'wb') as f:
             pkl.dump(self.samples, f)
         
-        # FIXED: Also save obs_sets when caching samples
         with open(self.cache_dir / "obs_sets.pkl", 'wb') as f:
             pkl.dump(self.obs_sets, f)
 
@@ -563,7 +590,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         hdf5_file = self.cache_dir / "multi_agent_trajectory_data.h5"
 
         try:
-            with h5py.File(hdf5_file, 'r') as f:  # Fixed: use h5py.File instead of open
+            with h5py.File(hdf5_file, 'r') as f:
                 if video_key not in f:
                     return None
                 if str(track_id) not in f[video_key]:
@@ -573,6 +600,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
 
                 return {
                     'coords': track_grp['coords'][:].astype(np.float32),
+                    'coords_orig': track_grp['coords_orig'][:].astype(np.float32),
                     'frames': track_grp['frames'][:].astype(np.int32),
                     'occluded': track_grp['occluded'][:].astype(np.float32),
                     'labels': [label.decode('utf-8') for label in track_grp['labels'][:]]
@@ -581,16 +609,21 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             print(f"Error loading trajectory data for {video_key}/{track_id}: {e}")
             return None
         
-    def _compute_deltas_vectorized(self, positions, temporal_masks, is_future=False, past_positions=None):
-        """Vectorized delta computation"""
+    def _compute_deltas_vectorized_safe(self, positions, temporal_masks, is_future=False, past_positions=None, pad_value=-999.0):
+        """Vectorized delta computation that properly handles pad values"""
         max_agents, seq_len, _ = positions.shape
-        deltas = np.zeros_like(positions)
+        deltas = np.full_like(positions, pad_value)  # Initialize with pad values
         
         for agent_idx in range(max_agents):
             if not np.any(temporal_masks[agent_idx]):
                 continue
                 
             valid_indices = np.where(temporal_masks[agent_idx] > 0)[0]
+            
+            # Also check for non-padded positions
+            non_padded_mask = ~(positions[agent_idx] == pad_value).any(axis=1)
+            valid_indices = valid_indices[non_padded_mask[valid_indices]]
+            
             if len(valid_indices) <= 1 and not is_future:
                 continue
             
@@ -599,6 +632,9 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                 past_mask = temporal_masks[agent_idx] if past_positions.shape[1] == seq_len else None
                 if past_mask is not None:
                     past_valid = np.where(past_mask > 0)[0]
+                    past_non_padded = ~(past_positions[agent_idx] == pad_value).any(axis=1)
+                    past_valid = past_valid[past_non_padded[past_valid]]
+                    
                     if len(past_valid) > 0 and len(valid_indices) > 0:
                         last_past_idx = past_valid[-1]
                         first_future_idx = valid_indices[0]
@@ -619,36 +655,26 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                     )
         
         return deltas
-    def _normalize_coords_vectorized(self, coords_array, temporal_mask, video_key):
-        """Vectorized coordinate normalization"""
-        if self.video_stats is None or video_key not in self.video_stats:
-            return coords_array
-        
-        stats = self.video_stats[video_key]
-        mean = stats['mean'].reshape(1, 1, 2)  # Broadcast shape
-        std = stats['std'].reshape(1, 1, 2) + 1e-8
-        
-        # Only normalize where temporal_mask is True
-        normalized = coords_array.copy()
-        mask_expanded = temporal_mask[:, :, np.newaxis]  # Shape: (agents, time, 1)
-        normalized = np.where(mask_expanded, (coords_array - mean) / std, coords_array)
-        
-        return normalized
-        
-    def _normalize_coords(self, coords, video_key):
-        """Normalize coordinates using video-specific statistics"""
-        if self.video_stats is None or video_key not in self.video_stats:
-            return coords
-        
-        stats = self.video_stats[video_key]
-        normalized = (coords - stats['mean']) / (stats['std'] + 1e-8)
-        return normalized
     
     def get_video_stats(self, video_key):
         """Return video-specific statistics for denormalization"""
         if self.video_stats is None:
             return None
         return self.video_stats.get(video_key, None)
+    
+    def denormalize_coordinates(self, normalized_coords, video_key):
+        """Denormalize coordinates using video-specific statistics"""
+        if not self.normalize_positions or self.video_stats is None:
+            return normalized_coords
+        
+        if video_key not in self.video_stats:
+            return normalized_coords
+            
+        stats = self.video_stats[video_key]
+        mean = stats['mean']
+        std = stats['std'] + 1e-8
+        
+        return normalized_coords * std + mean
     
     def __len__(self):
         if self.lazy_loading:
@@ -664,10 +690,10 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         
         # Lazy loading: load sample on demand
         sample_idx = self.sample_indices[idx]
-        return self._load_multi_agent_sample_on_demand(sample_idx)
-
-    def _load_multi_agent_sample_on_demand(self, sample_idx):
-        """Optimized multi-agent sample loading with vectorized operations"""
+        return self._load_multi_agent_sample_on_demand_optimized(sample_idx)
+    
+    def _load_multi_agent_sample_on_demand_optimized(self, sample_idx):
+        """OPTIMIZED: Multi-agent sample loading with pre-normalized coordinates"""
         # Get observation set with fallback
         obs_set = self.obs_sets.get((sample_idx['location'], sample_idx['video']), set()) if self.obs_sets else set()
         
@@ -679,7 +705,7 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         future_frames = window_frames[self.T_past:]
         num_agents = min(len(valid_agents), self.max_agents)
         
-        # Load all trajectory data in one batch
+        # Load all trajectory data in one batch - coordinates are already normalized!
         track_ids_tuple = tuple(valid_agents[:self.max_agents])
         batch_data = self._load_trajectory_data_batch(video_key, track_ids_tuple)
         
@@ -714,58 +740,76 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             arrays['agent_masks'][agent_idx] = 1.0
             arrays['agent_ids'][agent_idx] = track_id
         
-        # Vectorized processing of past frames
+        # Vectorized processing of past frames - coordinates are already normalized!
         for t, frame in enumerate(past_frames):
             for agent_idx, lookup_data in frame_lookups.items():
                 if frame in lookup_data['frame_to_idx']:
                     data_idx = lookup_data['frame_to_idx'][frame]
                     track_data = lookup_data['data']
-                    coords = track_data['coords'][data_idx]
                     
-                    # Set positions and masks
-                    arrays['past_positions_orig'][agent_idx, t] = coords
-                    arrays['past_positions'][agent_idx, t] = coords
-                    arrays['temporal_masks_past'][agent_idx, t] = 1.0
-                    arrays['obs_masks'][agent_idx, t] = 1.0 if (arrays['agent_ids'][agent_idx], int(frame)) in obs_set else 0.0
+                    # Use pre-normalized coordinates directly
+                    coords_normalized = track_data['coords'][data_idx]
+                    coords_orig = track_data['coords_orig'][data_idx]
                     
-                    # Set label if not already set
-                    if arrays['agent_labels'][agent_idx] == -1:
-                        label = track_data['labels'][data_idx]
-                        if label in self.cls2idx:
-                            arrays['agent_labels'][agent_idx] = self.cls2idx[label]
+                    # Validate coordinates before setting
+                    if not (np.isnan(coords_normalized).any() or np.isinf(coords_normalized).any()):
+                        # Set positions and masks - no normalization needed!
+                        arrays['past_positions'][agent_idx, t] = coords_normalized
+                        arrays['past_positions_orig'][agent_idx, t] = coords_orig
+                        arrays['temporal_masks_past'][agent_idx, t] = 1.0
+                        arrays['obs_masks'][agent_idx, t] = 1.0 if (arrays['agent_ids'][agent_idx], int(frame)) in obs_set else 0.0
+                        
+                        # Set label if not already set
+                        if arrays['agent_labels'][agent_idx] == -1:
+                            label = track_data['labels'][data_idx]
+                            if label in self.cls2idx:
+                                arrays['agent_labels'][agent_idx] = self.cls2idx[label]
+                    else:
+                        print(f"Warning: Invalid coordinates {coords_normalized} for agent {agent_idx} at frame {frame}")
         
-        # Vectorized processing of future frames
+        # Vectorized processing of future frames - coordinates are already normalized!
         for t, frame in enumerate(future_frames):
             for agent_idx, lookup_data in frame_lookups.items():
                 if frame in lookup_data['frame_to_idx']:
                     data_idx = lookup_data['frame_to_idx'][frame]
                     track_data = lookup_data['data']
-                    coords = track_data['coords'][data_idx]
                     
-                    # Set positions and masks
-                    arrays['future_positions_orig'][agent_idx, t] = coords
-                    arrays['future_positions'][agent_idx, t] = coords
-                    arrays['temporal_masks_future'][agent_idx, t] = 1.0
-                    arrays['occ_masks'][agent_idx, t] = track_data['occluded'][data_idx]
+                    # Use pre-normalized coordinates directly
+                    coords_normalized = track_data['coords'][data_idx]
+                    coords_orig = track_data['coords_orig'][data_idx]
+                    
+                    # Validate coordinates before setting
+                    if not (np.isnan(coords_normalized).any() or np.isinf(coords_normalized).any()):
+                        # Set positions and masks - no normalization needed!
+                        arrays['future_positions'][agent_idx, t] = coords_normalized
+                        arrays['future_positions_orig'][agent_idx, t] = coords_orig
+                        arrays['temporal_masks_future'][agent_idx, t] = 1.0
+                        arrays['occ_masks'][agent_idx, t] = track_data['occluded'][data_idx]
+                    else:
+                        print(f"Warning: Invalid coordinates {coords_normalized} for agent {agent_idx} at frame {frame}")
         
-        # Vectorized normalization
-        if self.normalize_positions:
-            # Only normalize for valid agents
-            valid_agent_mask = arrays['agent_masks'] > 0
-            if np.any(valid_agent_mask):
-                # Normalize past positions
-                arrays['past_positions'][valid_agent_mask] = self._normalize_coords_vectorized(
-                    arrays['past_positions'][valid_agent_mask], 
-                    arrays['temporal_masks_past'][valid_agent_mask], 
-                    video_key
-                )
+        # Validate all arrays before creating sample
+        for key, arr in arrays.items():
+            if isinstance(arr, np.ndarray):
+                if np.isnan(arr).any():
+                    print(f"Warning: NaN found in {key}, replacing with appropriate values")
+                    if key in ['past_positions', 'future_positions', 'past_positions_orig', 'future_positions_orig']:
+                        # Replace NaN with pad value for position arrays
+                        arr = np.where(np.isnan(arr), self.pad_value, arr)
+                    else:
+                        # Replace NaN with 0 for other arrays
+                        arr = np.nan_to_num(arr, nan=0.0)
+                    arrays[key] = arr
                 
-                # Normalize future positions  
-                arrays['future_positions'][valid_agent_mask] = self._normalize_coords_vectorized(
-                    arrays['future_positions'][valid_agent_mask], 
-                    arrays['temporal_masks_future'][valid_agent_mask], 
-                    video_key
-                )
+                if np.isinf(arr).any():
+                    print(f"Warning: Inf found in {key}, replacing with appropriate values")
+                    if key in ['past_positions', 'future_positions', 'past_positions_orig', 'future_positions_orig']:
+                        # Replace Inf with pad value for position arrays
+                        arr = np.where(np.isinf(arr), self.pad_value, arr)
+                    else:
+                        # Replace Inf with 0 for other arrays
+                        arr = np.where(np.isinf(arr), 0.0, arr)
+                    arrays[key] = arr
         
         # Create base sample
         sample = {
@@ -788,36 +832,27 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             'frame_subsample_rate': self.frame_subsample
         }
         
-        # Vectorized delta computation
+        # Safe delta computation that handles pad values
         if self.use_deltas:
-            valid_agent_mask = arrays['agent_masks'] > 0
-            
-            # Compute deltas only for valid agents
-            past_deltas = self._compute_deltas_vectorized(
+            # Compute deltas on the normalized coordinates
+            past_deltas = self._compute_deltas_vectorized_safe(
                 arrays['past_positions'], 
-                arrays['temporal_masks_past']
+                arrays['temporal_masks_past'],
+                pad_value=self.pad_value
             )
             
-            future_deltas = self._compute_deltas_vectorized(
+            future_deltas = self._compute_deltas_vectorized_safe(
                 arrays['future_positions'], 
                 arrays['temporal_masks_future'],
                 is_future=True,
-                past_positions=arrays['past_positions']
+                past_positions=arrays['past_positions'],
+                pad_value=self.pad_value
             )
             
             sample['past_deltas'] = past_deltas
             sample['future_deltas'] = future_deltas
         
         return self._format_sample(sample)
-
-    def __del__(self):
-        """Clean up HDF5 file handles"""
-        if hasattr(self, '_hdf5_file_cache'):
-            if hasattr(self._hdf5_file_cache, 'file') and self._hdf5_file_cache.file:
-                try:
-                    self._hdf5_file_cache.file.close()
-                except:
-                    pass
     
     def _format_sample(self, sample):
         """Format sample for model consumption"""

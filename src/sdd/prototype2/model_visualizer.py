@@ -15,8 +15,8 @@ import argparse
 
 # Import your existing classes (assuming they're in the same directory or importable)
 # You may need to adjust these imports based on your file structure
-from training_loop3 import OptimizedMultiAgentSequenceDataset, collate_fn
-from new_model import GraphInteractionModel
+from newest_training_loop import OptimizedMultiAgentSequenceDataset, collate_fn
+from dec_mod import DecoderOnlyTrajectoryModel
 
 class TrajectoryVisualizer:
     """Visualize trajectory predictions on reference images"""
@@ -29,10 +29,10 @@ class TrajectoryVisualizer:
         print("Loading model...")
         checkpoint = torch.load(model_checkpoint_path, map_location=self.device)
         
-        self.model = GraphInteractionModel(
+        self.model = DecoderOnlyTrajectoryModel(
             num_classes=len(checkpoint['classes']),
             locations=checkpoint['locations'],
-            d_model=16,
+            d_model=64,
             nhead=8,
             num_layers=3,
             T_past=config['T_past'],
@@ -326,75 +326,154 @@ class TrajectoryVisualizer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Visualize trajectory predictions')
-    parser.add_argument('--model_path', type=str, required=True,
-                       help='Path to model checkpoint')
-    parser.add_argument('--data_config', type=str, 
-                       help='Path to data configuration JSON file')
-    parser.add_argument('--output_dir', type=str, default='trajectory_visualizations',
-                       help='Output directory for visualizations')
-    parser.add_argument('--num_sequences', type=int, default=8,
-                       help='Number of sequences to visualize')
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='Device to use (cuda/cpu)')
+    # parser = argparse.ArgumentParser(description='Visualize trajectory predictions')
+    # parser.add_argument('--model_path', type=str, required=True,
+    #                    help='Path to model checkpoint')
+    # parser.add_argument('--data_config', type=str, 
+    #                    help='Path to data configuration JSON file')
+    # parser.add_argument('--output_dir', type=str, default='trajectory_visualizations',
+    #                    help='Output directory for visualizations')
+    # parser.add_argument('--num_sequences', type=int, default=8,
+    #                    help='Number of sequences to visualize')
+    # parser.add_argument('--device', type=str, default='cuda',
+    #                    help='Device to use (cuda/cpu)')
     
-    args = parser.parse_args()
+    # args = parser.parse_args()
     
-    # Default configuration (modify as needed)
-    default_config = {
-        'drone_data_root': "/Users/aakarshrai/Desktop/square_stanford_data",
-        'original_dataset_root': "/Users/aakarshrai/Desktop/stanford_data/archive",
-        'cache_dir': "new_cache_16",
-        'batch_size': 8,
-        'num_workers': 0,
-        'max_agents': 128,
-        'T_past': 10,
-        'T_future': 20,
-        'frame_subsample': 12
+    # # Default configuration (modify as needed)
+    # default_config = {
+    #     'drone_data_root': "/Users/aakarshrai/Desktop/square_stanford_data",
+    #     'original_dataset_root': "/Users/aakarshrai/Desktop/stanford_data/archive",
+    #     'cache_dir': "new_cache_16",
+    #     'batch_size': 8,
+    #     'num_workers': 0,
+    #     'max_agents': 128,
+    #     'T_past': 10,
+    #     'T_future': 20,
+    #     'frame_subsample': 12
+    # }
+    
+    # # Load config from file if provided
+    # if args.data_config:
+    #     with open(args.data_config, 'r') as f:
+    #         config = json.load(f)
+    # else:
+    #     config = default_config
+    #     print("Using default configuration. Consider providing --data_config for custom settings.")
+    
+    # # Initialize visualizer
+    # visualizer = TrajectoryVisualizer(
+    #     model_checkpoint_path=args.model_path,
+    #     config=config,
+    #     device=args.device
+    # )
+    
+    # # Load dataset
+    # classes = ['Pedestrian', 'Biker', 'Skater', 'Cart', 'Car', 'Bus']
+    
+    # print("Loading dataset...")
+    # dataset = OptimizedMultiAgentSequenceDataset(
+    #     drone_data_root=config['drone_data_root'],
+    #     original_dataset_root=config['original_dataset_root'],
+    #     classes=classes,
+    #     T_past=config['T_past'],
+    #     T_future=config['T_future'],
+    #     use_deltas=True,
+    #     normalize_positions=True,
+    #     cache_dir=config['cache_dir'],
+    #     lazy_loading=True,
+    #     num_workers=config['num_workers'],
+    #     max_agents=config['max_agents'],
+    #     frame_subsample=config['frame_subsample']
+    # )
+    
+    # print(f"Dataset loaded with {len(dataset)} samples")
+    
+    # # Create visualizations
+    # visualizer.create_visualizations(
+    #     dataset=dataset,
+    #     num_sequences=args.num_sequences,
+    #     output_dir=args.output_dir
+    # )
+
+# -----------------------------------------------------------------------------
+# Configuration dictionary (modify values as needed)
+# -----------------------------------------------------------------------------
+    config = {
+        # Paths and general settings
+        'model_path': '/Users/aakarshrai/Downloads/checkpoint_epoch_009.pth',
+        'data_config': None,    # Path to JSON file; set to None to use defaults below
+        'output_dir': 'visualizations',
+        'num_sequences': 8,
+        'device': 'cuda',       # 'cuda' or 'cpu'
+
+        # Default data settings (overridden if data_config JSON is provided)
+        'data': {
+            'drone_data_root': '/Users/aakarshrai/Desktop/square_stanford_data',
+            'original_dataset_root': '/Users/aakarshrai/Desktop/stanford_data/archive',
+            'cache_dir': '/Users/aakarshrai/Downloads/new_cache_64',
+            'batch_size': 8,
+            'num_workers': 0,
+            'max_agents': 64,
+            'T_past': 10,
+            'T_future': 20,
+            'frame_subsample': 12,
+            'use_deltas': True,
+            'normalize_positions': True,
+            'classes': ['Pedestrian', 'Biker', 'Skater', 'Cart', 'Car', 'Bus'],
+        }
     }
-    
-    # Load config from file if provided
-    if args.data_config:
-        with open(args.data_config, 'r') as f:
-            config = json.load(f)
+
+    # -----------------------------------------------------------------------------
+    # Load data-specific config from JSON if provided
+    # -----------------------------------------------------------------------------
+    if config['data_config']:
+        with open(config['data_config'], 'r') as f:
+            loaded = json.load(f)
+            # Merge JSON fields into config['data']
+            config['data'].update(loaded)
     else:
-        config = default_config
-        print("Using default configuration. Consider providing --data_config for custom settings.")
-    
-    # Initialize visualizer
+        print("Using default data configuration. To customize, set 'data_config' to a JSON file path.")
+
+    # Create output directory if needed
+    os.makedirs(config['output_dir'], exist_ok=True)
+
+    # -----------------------------------------------------------------------------
+    # Initialize visualizer and dataset
+    # -----------------------------------------------------------------------------
+
     visualizer = TrajectoryVisualizer(
-        model_checkpoint_path=args.model_path,
-        config=config,
-        device=args.device
+        model_checkpoint_path=config['model_path'],
+        config=config['data'],
+        device=config['device']
     )
-    
-    # Load dataset
-    classes = ['Pedestrian', 'Biker', 'Skater', 'Cart', 'Car', 'Bus']
-    
+
     print("Loading dataset...")
     dataset = OptimizedMultiAgentSequenceDataset(
-        drone_data_root=config['drone_data_root'],
-        original_dataset_root=config['original_dataset_root'],
-        classes=classes,
-        T_past=config['T_past'],
-        T_future=config['T_future'],
-        use_deltas=True,
-        normalize_positions=True,
-        cache_dir=config['cache_dir'],
+        drone_data_root=config['data']['drone_data_root'],
+        original_dataset_root=config['data']['original_dataset_root'],
+        classes=config['data']['classes'],
+        T_past=config['data']['T_past'],
+        T_future=config['data']['T_future'],
+        use_deltas=config['data']['use_deltas'],
+        normalize_positions=config['data']['normalize_positions'],
+        cache_dir=config['data']['cache_dir'],
         lazy_loading=True,
-        num_workers=config['num_workers'],
-        max_agents=config['max_agents'],
-        frame_subsample=config['frame_subsample']
+        num_workers=config['data']['num_workers'],
+        max_agents=config['data']['max_agents'],
+        frame_subsample=config['data']['frame_subsample']
     )
-    
     print(f"Dataset loaded with {len(dataset)} samples")
-    
-    # Create visualizations
+
+    # -----------------------------------------------------------------------------
+    # Generate and save visualizations
+    # -----------------------------------------------------------------------------
     visualizer.create_visualizations(
         dataset=dataset,
-        num_sequences=args.num_sequences,
-        output_dir=args.output_dir
+        num_sequences=config['num_sequences'],
+        output_dir=config['output_dir']
     )
+
 
 
 if __name__ == "__main__":

@@ -37,6 +37,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 warnings.filterwarnings('ignore')
 
+    
+    
 def process_drone_location_worker(args):
     """Worker function for processing drone location data"""
     drone_root, loc = args
@@ -694,37 +696,6 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                     )
         
         return deltas
-
-    def _safe_normalize_coords_vectorized(self, coords_array, temporal_mask, video_key, pad_value=-999.0):
-        """FIXED: Vectorized coordinate normalization that properly handles pad values"""
-        if self.video_stats is None or video_key not in self.video_stats:
-            return coords_array
-
-        stats = self.video_stats[video_key]
-        mean = stats['mean'].reshape(1, 1, 2)  # Broadcast shape
-        std = stats['std'].reshape(1, 1, 2) + 1e-8
-
-        # Create mask for valid (non-padded) positions
-        valid_positions_mask = ~(coords_array == pad_value).any(axis=-1, keepdims=True)  # Shape: (agents, time, 1)
-
-        # Combine with temporal mask
-        combined_mask = temporal_mask[:, :, np.newaxis] * valid_positions_mask  # Shape: (agents, time, 1)
-
-        # Only normalize where both temporal_mask is True AND position is not padded
-        normalized = coords_array.copy()
-
-        # Apply normalization only to valid positions
-        valid_coords = coords_array[combined_mask.squeeze(-1)]
-        if len(valid_coords) > 0:
-            normalized_valid = (valid_coords.reshape(-1, 2) - mean.reshape(2)) / std.reshape(2)
-
-            # Put normalized values back
-            normalized[combined_mask.squeeze(-1)] = normalized_valid
-
-        # Keep pad values as pad values (don't normalize them)
-        normalized = np.where(valid_positions_mask, normalized, coords_array)
-
-        return normalized
     
     def get_video_stats(self, video_key):
         """Return video-specific statistics for denormalization"""
@@ -746,13 +717,12 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         
         return normalized_coords * std + mean
     
-
     def __len__(self):
         if self.lazy_loading:
             return len(self.sample_indices)
         else:
             return len(self.samples)
-
+    
     def __getitem__(self, idx):
         if not self.lazy_loading:
             # Use pre-loaded samples
@@ -761,10 +731,10 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         
         # Lazy loading: load sample on demand
         sample_idx = self.sample_indices[idx]
-        return self._load_multi_agent_sample_on_demand_fixed(sample_idx)
+        return self._load_multi_agent_sample_on_demand_optimized(sample_idx)
     
-    def _load_multi_agent_sample_on_demand_fixed(self, sample_idx):
-        """FIXED: Multi-agent sample loading with proper pad value handling"""
+    def _load_multi_agent_sample_on_demand_optimized(self, sample_idx):
+        """OPTIMIZED: Multi-agent sample loading with pre-normalized coordinates"""
         # Get observation set with fallback
         obs_set = self.obs_sets.get((sample_idx['location'], sample_idx['video']), set()) if self.obs_sets else set()
         
@@ -773,10 +743,10 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
         valid_agents = sample_idx['valid_agents']
         
         past_frames = window_frames[:self.T_past]
-        future_frames = window_frames[self.T_future:]
+        future_frames = window_frames[self.T_past:]
         num_agents = min(len(valid_agents), self.max_agents)
         
-        # Load all trajectory data in one batch
+        # Load all trajectory data in one batch - coordinates are already normalized!
         track_ids_tuple = tuple(valid_agents[:self.max_agents])
         batch_data = self._load_trajectory_data_batch(video_key, track_ids_tuple)
         
@@ -811,19 +781,22 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             arrays['agent_masks'][agent_idx] = 1.0
             arrays['agent_ids'][agent_idx] = track_id
         
-        # Vectorized processing of past frames
+        # Vectorized processing of past frames - coordinates are already normalized!
         for t, frame in enumerate(past_frames):
             for agent_idx, lookup_data in frame_lookups.items():
                 if frame in lookup_data['frame_to_idx']:
                     data_idx = lookup_data['frame_to_idx'][frame]
                     track_data = lookup_data['data']
-                    coords = track_data['coords'][data_idx]
                     
-                    # FIXED: Validate coordinates before setting
-                    if not (np.isnan(coords).any() or np.isinf(coords).any()):
-                        # Set positions and masks
-                        arrays['past_positions_orig'][agent_idx, t] = coords
-                        arrays['past_positions'][agent_idx, t] = coords
+                    # Use pre-normalized coordinates directly
+                    coords_normalized = track_data['coords'][data_idx]
+                    coords_orig = track_data['coords_orig'][data_idx]
+                    
+                    # Validate coordinates before setting
+                    if not (np.isnan(coords_normalized).any() or np.isinf(coords_normalized).any()):
+                        # Set positions and masks - no normalization needed!
+                        arrays['past_positions'][agent_idx, t] = coords_normalized
+                        arrays['past_positions_orig'][agent_idx, t] = coords_orig
                         arrays['temporal_masks_past'][agent_idx, t] = 1.0
                         arrays['obs_masks'][agent_idx, t] = 1.0 if (arrays['agent_ids'][agent_idx], int(frame)) in obs_set else 0.0
                         
@@ -833,52 +806,50 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                             if label in self.cls2idx:
                                 arrays['agent_labels'][agent_idx] = self.cls2idx[label]
                     else:
-                        print(f"Warning: Invalid coordinates {coords} for agent {agent_idx} at frame {frame}")
+                        print(f"Warning: Invalid coordinates {coords_normalized} for agent {agent_idx} at frame {frame}")
         
-        # Vectorized processing of future frames
+        # Vectorized processing of future frames - coordinates are already normalized!
         for t, frame in enumerate(future_frames):
             for agent_idx, lookup_data in frame_lookups.items():
                 if frame in lookup_data['frame_to_idx']:
                     data_idx = lookup_data['frame_to_idx'][frame]
                     track_data = lookup_data['data']
-                    coords = track_data['coords'][data_idx]
                     
-                    # FIXED: Validate coordinates before setting
-                    if not (np.isnan(coords).any() or np.isinf(coords).any()):
-                        # Set positions and masks
-                        arrays['future_positions_orig'][agent_idx, t] = coords
-                        arrays['future_positions'][agent_idx, t] = coords
+                    # Use pre-normalized coordinates directly
+                    coords_normalized = track_data['coords'][data_idx]
+                    coords_orig = track_data['coords_orig'][data_idx]
+                    
+                    # Validate coordinates before setting
+                    if not (np.isnan(coords_normalized).any() or np.isinf(coords_normalized).any()):
+                        # Set positions and masks - no normalization needed!
+                        arrays['future_positions'][agent_idx, t] = coords_normalized
+                        arrays['future_positions_orig'][agent_idx, t] = coords_orig
                         arrays['temporal_masks_future'][agent_idx, t] = 1.0
                         arrays['occ_masks'][agent_idx, t] = track_data['occluded'][data_idx]
                     else:
-                        print(f"Warning: Invalid coordinates {coords} for agent {agent_idx} at frame {frame}")
+                        print(f"Warning: Invalid coordinates {coords_normalized} for agent {agent_idx} at frame {frame}")
         
-        # FIXED: Safe normalization that preserves pad values
-        if self.normalize_positions:
-            valid_agent_mask = arrays['agent_masks'] > 0
-            if np.any(valid_agent_mask):
-                arrays['past_positions'] = self._safe_normalize_coords_vectorized(
-                    arrays['past_positions'], 
-                    arrays['temporal_masks_past'], 
-                    video_key,
-                    pad_value=self.pad_value
-                )
-                arrays['future_positions'] = self._safe_normalize_coords_vectorized(
-                    arrays['future_positions'], 
-                    arrays['temporal_masks_future'], 
-                    video_key,
-                    pad_value=self.pad_value
-                )
-        
-        # FIXED: Validate all arrays before creating sample
+        # Validate all arrays before creating sample
         for key, arr in arrays.items():
             if isinstance(arr, np.ndarray):
-                if np.isnan(arr).any() or np.isinf(arr).any():
-                    # Replace invalids
-                    if key in ['past_positions','future_positions','past_positions_orig','future_positions_orig']:
-                        arr = np.where(~np.isfinite(arr), self.pad_value, arr)
+                if np.isnan(arr).any():
+                    print(f"Warning: NaN found in {key}, replacing with appropriate values")
+                    if key in ['past_positions', 'future_positions', 'past_positions_orig', 'future_positions_orig']:
+                        # Replace NaN with pad value for position arrays
+                        arr = np.where(np.isnan(arr), self.pad_value, arr)
                     else:
-                        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                        # Replace NaN with 0 for other arrays
+                        arr = np.nan_to_num(arr, nan=0.0)
+                    arrays[key] = arr
+                
+                if np.isinf(arr).any():
+                    print(f"Warning: Inf found in {key}, replacing with appropriate values")
+                    if key in ['past_positions', 'future_positions', 'past_positions_orig', 'future_positions_orig']:
+                        # Replace Inf with pad value for position arrays
+                        arr = np.where(np.isinf(arr), self.pad_value, arr)
+                    else:
+                        # Replace Inf with 0 for other arrays
+                        arr = np.where(np.isinf(arr), 0.0, arr)
                     arrays[key] = arr
         
         # Create base sample
@@ -887,28 +858,31 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
             'future_positions': arrays['future_positions'],
             'past_positions_orig': arrays['past_positions_orig'],
             'future_positions_orig': arrays['future_positions_orig'],
-            'obs_masks': arrays['obs_masks'],
-            'temporal_masks_past': arrays['temporal_masks_past'],
-            'temporal_masks_future': arrays['temporal_masks_future'],
-            'occ_masks': arrays['occ_masks'],
-            'agent_masks': arrays['agent_masks'],
+            'obs_masks': arrays['obs_masks'],     # Whether observed by drone (only meaningful in past)
+            'temporal_masks_past': arrays['temporal_masks_past'],    # Whether agent exists at this timestep
+            'temporal_masks_future': arrays['temporal_masks_future'], # Whether agent exists at this timestep
+            'occ_masks': arrays['occ_masks'],    # Occlusion values (only meaningful where temporal_mask=1)
+            'agent_masks': arrays['agent_masks'],    # Whether agent slot is used (not padding)  
+            'agent_masks': arrays['agent_masks'],    
             'agent_labels': arrays['agent_labels'],
             'agent_ids': arrays['agent_ids'],
             'location': sample_idx['location'],
             'video': sample_idx['video'],
-            'start_frame': sample_idx.get('start_frame', None),
+            'start_frame': sample_idx['start_frame'],
             'num_valid_agents': num_agents,
-            'subsampled_frames': window_frames,
-            'frame_subsample_rate': self.frame_subsample
+            'subsampled_frames': window_frames,    # NEW: Store the actual subsampled frame numbers
+            'frame_subsample_rate': self.frame_subsample    # NEW: Store subsample rate for reference
         }
         
-        # FIXED: Safe delta computation that handles pad values
+        # Safe delta computation that handles pad values
         if self.use_deltas:
+            # Compute deltas on the normalized coordinates
             past_deltas = self._compute_deltas_vectorized_safe(
                 arrays['past_positions'], 
                 arrays['temporal_masks_past'],
                 pad_value=self.pad_value
             )
+            
             future_deltas = self._compute_deltas_vectorized_safe(
                 arrays['future_positions'], 
                 arrays['temporal_masks_future'],
@@ -916,173 +890,18 @@ class OptimizedMultiAgentSequenceDataset(Dataset):
                 past_positions=arrays['past_positions'],
                 pad_value=self.pad_value
             )
+            
             sample['past_deltas'] = past_deltas
             sample['future_deltas'] = future_deltas
         
         return self._format_sample(sample)
     
-    
-
-
-    # def _load_multi_agent_sample_on_demand(self, sample_idx):
-    #     """Optimized multi-agent sample loading with vectorized operations"""
-    #     # Get observation set with fallback
-    #     obs_set = self.obs_sets.get((sample_idx['location'], sample_idx['video']), set()) if self.obs_sets else set()
-        
-    #     video_key = f"{sample_idx['location']}_{sample_idx['video']}"
-    #     window_frames = sample_idx['window_frames']
-    #     valid_agents = sample_idx['valid_agents']
-        
-    #     past_frames = window_frames[:self.T_past]
-    #     future_frames = window_frames[self.T_past:]
-    #     num_agents = min(len(valid_agents), self.max_agents)
-        
-    #     # Load all trajectory data in one batch
-    #     track_ids_tuple = tuple(valid_agents[:self.max_agents])
-    #     batch_data = self._load_trajectory_data_batch(video_key, track_ids_tuple)
-        
-    #     # Pre-allocate all arrays
-    #     arrays = {
-    #         'past_positions': np.full((self.max_agents, self.T_past, 2), self.pad_value, dtype=np.float32),
-    #         'future_positions': np.full((self.max_agents, self.T_future, 2), self.pad_value, dtype=np.float32),
-    #         'past_positions_orig': np.full((self.max_agents, self.T_past, 2), self.pad_value, dtype=np.float32),
-    #         'future_positions_orig': np.full((self.max_agents, self.T_future, 2), self.pad_value, dtype=np.float32),
-    #         'obs_masks': np.zeros((self.max_agents, self.T_past), dtype=np.float32),
-    #         'temporal_masks_past': np.zeros((self.max_agents, self.T_past), dtype=np.float32),
-    #         'temporal_masks_future': np.zeros((self.max_agents, self.T_future), dtype=np.float32),
-    #         'occ_masks': np.zeros((self.max_agents, self.T_future), dtype=np.float32),
-    #         'agent_masks': np.zeros(self.max_agents, dtype=np.float32),
-    #         'agent_labels': np.full(self.max_agents, -1, dtype=np.int32),
-    #         'agent_ids': np.full(self.max_agents, -1, dtype=np.int32),
-    #     }
-        
-    #     # Pre-compute frame lookups for all agents
-    #     frame_lookups = {}
-    #     for agent_idx, track_id in enumerate(valid_agents[:self.max_agents]):
-    #         if track_id not in batch_data:
-    #             continue
-                
-    #         track_data = batch_data[track_id]
-    #         frame_lookups[agent_idx] = {
-    #             'frame_to_idx': {frame: idx for idx, frame in enumerate(track_data['frames'])},
-    #             'data': track_data
-    #         }
-            
-    #         # Set agent metadata
-    #         arrays['agent_masks'][agent_idx] = 1.0
-    #         arrays['agent_ids'][agent_idx] = track_id
-        
-    #     # Vectorized processing of past frames
-    #     for t, frame in enumerate(past_frames):
-    #         for agent_idx, lookup_data in frame_lookups.items():
-    #             if frame in lookup_data['frame_to_idx']:
-    #                 data_idx = lookup_data['frame_to_idx'][frame]
-    #                 track_data = lookup_data['data']
-    #                 coords = track_data['coords'][data_idx]
-                    
-    #                 # Set positions and masks
-    #                 arrays['past_positions_orig'][agent_idx, t] = coords
-    #                 arrays['past_positions'][agent_idx, t] = coords
-    #                 arrays['temporal_masks_past'][agent_idx, t] = 1.0
-    #                 arrays['obs_masks'][agent_idx, t] = 1.0 if (arrays['agent_ids'][agent_idx], int(frame)) in obs_set else 0.0
-                    
-    #                 # Set label if not already set
-    #                 if arrays['agent_labels'][agent_idx] == -1:
-    #                     label = track_data['labels'][data_idx]
-    #                     if label in self.cls2idx:
-    #                         arrays['agent_labels'][agent_idx] = self.cls2idx[label]
-        
-    #     # Vectorized processing of future frames
-    #     for t, frame in enumerate(future_frames):
-    #         for agent_idx, lookup_data in frame_lookups.items():
-    #             if frame in lookup_data['frame_to_idx']:
-    #                 data_idx = lookup_data['frame_to_idx'][frame]
-    #                 track_data = lookup_data['data']
-    #                 coords = track_data['coords'][data_idx]
-                    
-    #                 # Set positions and masks
-    #                 arrays['future_positions_orig'][agent_idx, t] = coords
-    #                 arrays['future_positions'][agent_idx, t] = coords
-    #                 arrays['temporal_masks_future'][agent_idx, t] = 1.0
-    #                 arrays['occ_masks'][agent_idx, t] = track_data['occluded'][data_idx]
-        
-    #     # Vectorized normalization
-    #     if self.normalize_positions:
-    #         # Only normalize for valid agents
-    #         valid_agent_mask = arrays['agent_masks'] > 0
-    #         if np.any(valid_agent_mask):
-    #             # Normalize past positions
-    #             arrays['past_positions'][valid_agent_mask] = self._safe_normalize_coords_vectorized(
-    #                 arrays['past_positions'][valid_agent_mask], 
-    #                 arrays['temporal_masks_past'][valid_agent_mask], 
-    #                 video_key
-    #             )
-                
-    #             # Normalize future positions  
-    #             arrays['future_positions'][valid_agent_mask] = self._safe_normalize_coords_vectorized(
-    #                 arrays['future_positions'][valid_agent_mask], 
-    #                 arrays['temporal_masks_future'][valid_agent_mask], 
-    #                 video_key
-    #             )
-        
-    #     # Create base sample
-    #     sample = {
-    #         'past_positions': arrays['past_positions'],
-    #         'future_positions': arrays['future_positions'],
-    #         'past_positions_orig': arrays['past_positions_orig'],
-    #         'future_positions_orig': arrays['future_positions_orig'],
-    #         'obs_masks': arrays['obs_masks'],
-    #         'temporal_masks_past': arrays['temporal_masks_past'],
-    #         'temporal_masks_future': arrays['temporal_masks_future'],
-    #         'occ_masks': arrays['occ_masks'],
-    #         'agent_masks': arrays['agent_masks'],
-    #         'agent_labels': arrays['agent_labels'],
-    #         'agent_ids': arrays['agent_ids'],
-    #         'location': sample_idx['location'],
-    #         'video': sample_idx['video'],
-    #         'start_frame': sample_idx['start_frame'],
-    #         'num_valid_agents': num_agents,
-    #         'subsampled_frames': window_frames,
-    #         'frame_subsample_rate': self.frame_subsample
-    #     }
-        
-    #     # Vectorized delta computation
-    #     if self.use_deltas:
-    #         valid_agent_mask = arrays['agent_masks'] > 0
-            
-    #         # Compute deltas only for valid agents
-    #         past_deltas = self._compute_deltas_vectorized(
-    #             arrays['past_positions'], 
-    #             arrays['temporal_masks_past']
-    #         )
-            
-    #         future_deltas = self._compute_deltas_vectorized(
-    #             arrays['future_positions'], 
-    #             arrays['temporal_masks_future'],
-    #             is_future=True,
-    #             past_positions=arrays['past_positions']
-    #         )
-            
-    #         sample['past_deltas'] = past_deltas
-    #         sample['future_deltas'] = future_deltas
-        
-    #     return self._format_sample(sample)
-
-    # def __del__(self):
-    #     """Clean up HDF5 file handles"""
-    #     if hasattr(self, '_hdf5_file_cache'):
-    #         if hasattr(self._hdf5_file_cache, 'file') and self._hdf5_file_cache.file:
-    #             try:
-    #                 self._hdf5_file_cache.file.close()
-    #             except:
-    #                 pass
-
-
-    
     def _format_sample(self, sample):
         """Format sample for model consumption"""
         # Convert to tensors if needed
-        return sample
+        return sample 
+    
+
 
 class StableTrajectoryLoss(nn.Module):
     """FIXED: More stable loss function with proper NaN/Inf handling"""
@@ -1279,19 +1098,47 @@ class EarlyStopping:
         return False
 
 
+# def collate_fn(batch):
+#     """Custom collate function for batching"""
+#     batched = {}
+#     for key in batch[0].keys():
+#         if isinstance(batch[0][key], torch.Tensor):
+#             batched[key] = torch.stack([item[key] for item in batch])
+#         elif isinstance(batch[0][key], np.ndarray):
+#             #batched[key] = torch.from_numpy(np.stack([item[key] for item in batch]))
+#             arr = np.stack([item[key] for item in batch])
+#             if arr.dtype.kind in {"i", "u"}:       # any integer type
+#                 arr = arr.astype(np.int64)
+#                 batched[key] = torch.from_numpy(arr)
+#         else:
+#             # For non-tensor data like strings, lists, etc.
+#             batched[key] = [item[key] for item in batch]
+    
+#     return batched
 def collate_fn(batch):
-    """Custom collate function for batching"""
     batched = {}
     for key in batch[0].keys():
+
+        # PyTorch tensors: just stack
         if isinstance(batch[0][key], torch.Tensor):
             batched[key] = torch.stack([item[key] for item in batch])
+
+        # NumPy arrays: stack → maybe cast → torch
         elif isinstance(batch[0][key], np.ndarray):
-            batched[key] = torch.from_numpy(np.stack([item[key] for item in batch]))
+            arr = np.stack([item[key] for item in batch])
+
+            # Cast only **integer** arrays to int64 for embeddings / CE
+            if arr.dtype.kind in {"i", "u"}:
+                arr = arr.astype(np.int64)
+
+            batched[key] = torch.from_numpy(arr)   # ← always assign
+
+        # Anything else (strings, lists, …)
         else:
-            # For non-tensor data like strings, lists, etc.
             batched[key] = [item[key] for item in batch]
-    
+
     return batched
+
 
 
 def debug_model_forward(model, batch, device):
@@ -1368,7 +1215,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, schedule
             loss, loss_dict = criterion(predictions, batch)
             
             # FIXED: Skip batch if loss is too high
-            if loss > 100.0:
+            if loss > 1000.0:
                 print(f"Skipping batch {batch_idx} due to extremely high loss: {loss}")
                 continue
             
